@@ -1,0 +1,4 @@
+compile-flags.txt
+xdg-shell-*
+project_term
+*.o
