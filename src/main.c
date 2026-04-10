@@ -1,4 +1,7 @@
 #define _XOPEN_SOURCE 600
+#ifdef __FREEBSD__
+#define __BSD_VISIBLE 1
+#endif
 
 #include <stdio.h>
 #include <stdint.h>
@@ -18,7 +21,9 @@
 
 #include <poll.h>
 #include <pwd.h>
+#if defined(__linux__)
 #include <pty.h>
+#endif
 
 #include <sys/mman.h>
 #include <sys/poll.h>
@@ -33,8 +38,13 @@
 #include <hb-ft.h>
 
 #include <fontconfig/fontconfig.h>
-
 #include <xkbcommon/xkbcommon.h>
+
+#if defined(__FreeBSD__)
+#include <dev/evdev/input-event-codes.h>
+#elif defined(__linux__) 
+#include <linux/input-event-codes.h>
+#endif
 
 #include "../xdg-shell-client-protocol.h"
 #include "freetype/freetype.h"
@@ -42,19 +52,55 @@
 #define ROW_MAX 30
 #define COLUMN_MAX 100
 #define BG_COLOR 0xff000000
-#define FG_COLOR 0xf8f8f8f2
+#define FG_COLOR 0xfff8f8f2
+#define CSD_BG_COLOR 0xffd3d3d3
+#define CSD_FG_COLOR 0xff000000
 #define UTF8_ESCAPE 0x1b
 #define CURSOR_HOME_STR "[H"
 #define CLEAR_SCREEN_STR "[2J"
+#define CSDS_HEIGHT 20
 
 #define IN_RANGE(x, l, h) (x >= l && x <= h)
+
+#define WIDGET_LEFT 0
+#define WIDGET_RIGHT 1
+#define WIDGET_CENTER 2
+
+typedef struct {
+	int32_t x, y;
+	int32_t w, h;
+	uint32_t anchor;
+	uint32_t fg, bg;
+	uint32_t hfg, hbg;
+	uint32_t is_hovered;
+
+	const char *label;
+	void (*on_click)(void *data);
+	void *data;
+} widget_button_t;
+
+typedef struct widget_label {
+	int32_t x, y;
+	int32_t w, h;
+	uint32_t anchor;
+	uint32_t fg;
+
+	const char *label;
+} widget_label_t;
 
 typedef struct wayland_ctx_s {
 	struct wl_display *display;
 	struct wl_registry *registry;
 	struct wl_shm *shm;
 	struct wl_compositor *compositor;
+	struct wl_subcompositor *subcompositor;
 	struct xdg_wm_base *wm_base;
+
+	struct wl_surface *csd_surface;
+	struct wl_subsurface *csd_subsurface;
+	widget_label_t csd_title;
+	widget_button_t csd_buttons[3];
+
 	struct wl_surface *wl_surface;
 	struct xdg_surface *xdg_surface;
 	struct xdg_toplevel *xdg_toplevel;
@@ -63,6 +109,11 @@ typedef struct wayland_ctx_s {
 	struct wl_seat *seat;
 	struct wl_keyboard *keyboard;
 	struct wl_pointer *pointer;
+
+	struct wl_surface *focused_surface;
+	bool is_maximized;
+	bool wm_maximize;
+	bool wm_minimize;
 } wayland_ctx_t;
 
 typedef struct term_ctx_s {
@@ -424,6 +475,102 @@ static struct wl_buffer *draw_frame(term_ctx_t *ctx) {
 	return buffer;
 }
 
+static void draw_button(FT_Face face, widget_button_t *btn, uint32_t *data, int32_t w, int32_t h, int32_t stride) {
+	int32_t x = 0;
+	int32_t y = 0;
+	uint32_t bg = btn->is_hovered ? btn->hbg : btn->bg;
+	uint32_t fg = btn->is_hovered ? btn->hfg : btn->fg;
+
+	if(btn->anchor == WIDGET_LEFT) {
+		x = btn->x;
+	} else if(btn->anchor == WIDGET_RIGHT) {
+		x = w + btn->x;
+	} else if(btn->anchor == WIDGET_CENTER) {
+		x = w / 2 - btn->w / 2;
+	}
+
+	for(uint32_t yp = y; yp < y + btn->h; yp++) {
+		for(uint32_t xp = x; xp < x + btn->w; xp++) {
+			put_pixel(data, xp, yp, w, h, bg);
+		}
+	}
+
+	for(uint32_t i = 0; btn->label[i]; i++) {
+		render_char(face, btn->label[i], 16, x + 10 / 2, y, data, w, h, fg);
+	}
+}
+
+static void draw_label(FT_Face face, widget_label_t *label, void *data, int32_t w, int32_t h) {
+	int32_t x = 0;
+	int32_t y = 0;
+	uint32_t fg = label->fg;
+	uint32_t x_advance = face->size->metrics.max_advance >> 6;
+
+	if(label->anchor == WIDGET_LEFT) {
+		x = label->x;
+	} else if(label->anchor == WIDGET_RIGHT) {
+		x = w + label->x;
+	} else if(label->anchor == WIDGET_CENTER) {
+		x = w / 2 - label->w / 2;
+	}
+
+	uint32_t labelwidth = x_advance * strlen(label->label);
+
+	for(uint32_t i = 0; label->label[i]; i++) {
+		render_char(face, label->label[i], 16, (x - labelwidth / 2) + i * x_advance, y, data, w, h, fg);
+	}
+}
+
+
+static struct wl_buffer *draw_subsurface_frame(term_ctx_t *ctx) {
+	struct wl_buffer *buffer = NULL;
+	struct wl_shm_pool *pool = NULL;
+	int32_t width = ctx->wl->width;
+	int32_t height = CSDS_HEIGHT;
+	int32_t stride = width * sizeof(uint32_t);
+	int32_t size = stride * height;
+	uint32_t *data = NULL;
+
+	int fd = allocate_shm_file(size);
+	if(fd < 0) {
+		return NULL;
+	}
+
+	data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if(data == MAP_FAILED) {
+		close(fd);
+		return NULL;
+	}
+
+	pool = wl_shm_create_pool(ctx->wl->shm, fd, size);
+	if(!pool) {
+		close(fd);
+		return NULL;
+	}
+	buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
+	wl_shm_pool_destroy(pool);
+	close(fd);
+
+	for(int32_t y = 0; y < height; ++y) {
+		for(int32_t x = 0; x < width; ++x) {
+			data[y * width + x] = CSD_BG_COLOR;
+		}
+	}
+
+	draw_button(ctx->face, &ctx->wl->csd_buttons[0], data, width, height, stride);
+	if(ctx->wl->wm_maximize) {
+		draw_button(ctx->face, &ctx->wl->csd_buttons[1], data, width, height, stride);
+	}
+	if(ctx->wl->wm_minimize) {
+		draw_button(ctx->face, &ctx->wl->csd_buttons[2], data, width, height, stride);
+	}
+
+	draw_label(ctx->face, &ctx->wl->csd_title, data, width, height);
+	munmap(data, size);
+	wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
+	return buffer;
+}
+
 void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
 	term_ctx_t *state = (term_ctx_t*)data;
 
@@ -436,7 +583,7 @@ void xdg_toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_t w
 
 	ctx->wl->width = width ? width : 800;
 	ctx->wl->height = height ? height : 600;
-
+	ctx->wl->height -= CSDS_HEIGHT;
 	/*TODO Change ROW_MAX and COLUMN MAX based on window/font size*/
 	struct winsize wsz = { ROW_MAX, COLUMN_MAX, ctx->wl->width, ctx->wl->height };
 	ioctl(ctx->ptmx, TIOCSWINSZ, &wsz);
@@ -449,6 +596,14 @@ void xdg_toplevel_configure_bounds(void *data, struct xdg_toplevel *toplevel, in
 void xdg_toplevel_wm_capabilities(void *data, struct xdg_toplevel *toplevel, struct wl_array *caps) {
 	term_ctx_t *ctx = data;
 	printf("wm caps size: %zu %zu\n", caps->size, caps->size / sizeof(uint32_t));
+
+	for(uint32_t i = 0; i < caps->size / sizeof(uint32_t); i++) {
+		if(((uint32_t*)caps->data)[i] == XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE) {
+			ctx->wl->wm_maximize = true;
+		} else if(((uint32_t*)caps->data)[i] == XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE) {
+			ctx->wl->wm_minimize = true;
+		}
+	}
 }
 
 static const struct xdg_toplevel_listener xdg_toplevel_listener = {
@@ -463,12 +618,18 @@ void xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t ser
 	wayland_ctx_t *state = ctx->wl;
 	xdg_surface_ack_configure(surface, serial);
 
-	struct wl_buffer *buffer = draw_frame(data);
+	struct wl_buffer *buffer = draw_frame(ctx);
 	if(buffer == NULL) {
 		printf("draw_frame failed: %s\n", strerror(errno));
 		ctx->running = 0;
 		return;
 	}
+
+	struct wl_buffer *subsurface_buffer = draw_subsurface_frame(ctx);
+	wl_surface_attach(state->csd_surface, subsurface_buffer, 0, 0);
+	wl_surface_offset(state->csd_surface, 0, 0);
+	wl_surface_damage_buffer(state->csd_surface, 0, 0, state->width, CSDS_HEIGHT);
+	wl_surface_commit(state->csd_surface);
 
 	wl_surface_attach(state->wl_surface, buffer, 0, 0);
 	wl_surface_offset(state->wl_surface, 0, 0);
@@ -674,6 +835,12 @@ void term_event(term_ctx_t *term) {
 		return;
 	}
 
+	struct wl_buffer *subsurface_buffer = draw_subsurface_frame(term);
+	wl_surface_attach(term->wl->csd_surface, subsurface_buffer, 0, 0);
+	wl_surface_offset(term->wl->csd_surface, 0, 0);
+	wl_surface_damage_buffer(term->wl->csd_surface, 0, 0, term->wl->width, CSDS_HEIGHT);
+	wl_surface_commit(term->wl->csd_surface);
+
 	wl_surface_attach(term->wl->wl_surface, buffer, 0, 0);
 	wl_surface_offset(term->wl->wl_surface, 0, 0);
 	wl_surface_damage_buffer(term->wl->wl_surface, 0, 0, term->wl->width, term->wl->height);
@@ -717,16 +884,73 @@ static const struct wl_keyboard_listener wl_keyboard_listener = {
 	.repeat_info = wl_keyboard_handle_repeat_info,
 };
 
+static int btn_is_in(widget_button_t *btn, int32_t x, int32_t y, int32_t w, int32_t h) {
+	int32_t bx = 0;
+	int32_t by = btn->y;
+	int32_t bx1 = 0;
+	int32_t by1 = 0;
+
+	if(btn->anchor == WIDGET_LEFT) {
+		bx = btn->x;
+	} else if(btn->anchor == WIDGET_RIGHT) {
+		bx = w + btn->x;
+	} else if(btn->anchor == WIDGET_CENTER) {
+		bx = w / 2 + btn->w / 2 + btn->x;
+	}
+
+	bx1 = bx + btn->w;
+	by = btn->y;
+	by1 = by + btn->h;
+
+	if(x >= bx && x <= bx1 && y >= by && y <= by1) {
+		return 1;
+	}
+
+	return 0;
+}
+
 void wl_pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
+	term_ctx_t *ctx = (term_ctx_t*)data;
+
+	ctx->wl->focused_surface = surface;
 }
 
 void wl_pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface) {
+	term_ctx_t *ctx = (term_ctx_t*)data;
+
+	ctx->wl->focused_surface = NULL;
 }
 
 void wl_pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+	term_ctx_t *ctx = (term_ctx_t*)data;
+	wayland_ctx_t *wl = ctx->wl;
+	bool found = false;
+
+	for(uint32_t i = 0; i < 3; i++) {
+		if(wl->focused_surface == wl->csd_surface && btn_is_in(&ctx->wl->csd_buttons[i], wl_fixed_to_int(x), wl_fixed_to_int(y), wl->width, wl->height) && found == false) {
+			wl->csd_buttons[i].is_hovered = true;
+			found = true;
+		} else {
+			wl->csd_buttons[i].is_hovered = false;
+		}
+	}
+
+	struct wl_buffer *subsurface_buffer = draw_subsurface_frame(ctx);
+	wl_surface_attach(wl->csd_surface, subsurface_buffer, 0, 0);
+	wl_surface_offset(wl->csd_surface, 0, 0);
+	wl_surface_damage_buffer(wl->csd_surface, 0, 0, wl->width, CSDS_HEIGHT);
+	wl_surface_commit(wl->csd_surface);
 }
 
 void wl_pointer_handle_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
+	term_ctx_t *ctx = (term_ctx_t*)data;
+	wayland_ctx_t *wl = ctx->wl;
+
+	for(uint32_t i = 0; i < 3; i++) {
+		if(wl->csd_buttons[i].is_hovered && wl->csd_buttons[i].on_click && state && button == BTN_LEFT) {
+			wl->csd_buttons[i].on_click(wl->csd_buttons[i].data);
+		}
+	}
 }
 
 void wl_pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
@@ -789,7 +1013,7 @@ void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
 	if(caps & WL_SEAT_CAPABILITY_POINTER) {
 		if(state->pointer == NULL) {
 			state->pointer = wl_seat_get_pointer(seat);
-			wl_pointer_add_listener(state->pointer, &wl_pointer_listener, state);
+			wl_pointer_add_listener(state->pointer, &wl_pointer_listener, data);
 		}
 	} else if(state->pointer) {
 		wl_pointer_destroy(state->pointer);
@@ -817,6 +1041,8 @@ void wl_registry_global(void *data, struct wl_registry *registry, uint32_t name,
 	} else if(strcmp(interface, wl_seat_interface.name) == 0) {
 		state->seat = wl_registry_bind(registry, name, &wl_seat_interface, version);
 		wl_seat_add_listener(state->seat, &wl_seat_listener, ctx);
+	} else if(strcmp(interface, wl_subcompositor_interface.name) == 0) {
+		state->subcompositor = wl_registry_bind(registry, name, &wl_subcompositor_interface, version);
 	} else if(strcmp(interface, xdg_wm_base_interface.name) == 0) {
 		state->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, version);
 		xdg_wm_base_add_listener(state->wm_base, &xdg_wm_base_listener, ctx);
@@ -831,6 +1057,30 @@ static const struct wl_registry_listener wl_registry_listener = {
 	.global = wl_registry_global,
 	.global_remove = wl_registry_global_remove,
 };
+
+static void button_close_clicked(void *data) {
+	term_ctx_t *ctx = (term_ctx_t*)data;
+
+	ctx->running = 0;
+}
+
+static void button_maxmised_clicked(void *data) {
+	term_ctx_t *ctx = (term_ctx_t*)data;
+
+	if(ctx->wl->is_maximized == true) {
+		xdg_toplevel_unset_maximized(ctx->wl->xdg_toplevel);
+		ctx->wl->is_maximized = false;
+	} else {
+		xdg_toplevel_set_maximized(ctx->wl->xdg_toplevel);
+		ctx->wl->is_maximized = true;
+	}
+}
+
+static void button_minimized_clicked(void *data) {
+	term_ctx_t *ctx = (term_ctx_t*)data;
+
+	xdg_toplevel_set_minimized(ctx->wl->xdg_toplevel);
+}
 
 wayland_ctx_t *wayland_init(term_ctx_t *term) {
 	wayland_ctx_t *ctx = calloc(1, sizeof(wayland_ctx_t));
@@ -862,27 +1112,103 @@ wayland_ctx_t *wayland_init(term_ctx_t *term) {
 		goto err_free_globals;
 	}
 
+	if(ctx->subcompositor == NULL) {
+		printf("No wl_subcompositor\n");
+		goto err_free_globals;
+	}
+
+	if(ctx->seat == NULL) {
+		printf("No wl_seat\n");
+		goto err_free_globals;
+	}
+
+	if(ctx->wm_base == NULL) {
+		printf("No xdg_wm_base\n");
+		goto err_free_globals;
+	}	
+
+	if(ctx->shm == NULL) {
+		printf("No wl_shm\n");
+		goto err_free_globals;
+	}
+
 	ctx->wl_surface = wl_compositor_create_surface(ctx->compositor);
 	if(ctx->wl_surface == NULL) {
 		printf("wl_compositor_create_surface failed: %s\n", strerror(errno));
-		return NULL;
+		goto err_free_globals;
 	}
+	ctx->csd_surface = wl_compositor_create_surface(ctx->compositor);
+	if(ctx->csd_surface == NULL) {
+		printf("wl_compositor_create_surface failed: %s\n", strerror(errno));
+		goto err_free_surface;
+	}
+
+	ctx->csd_subsurface = wl_subcompositor_get_subsurface(ctx->subcompositor, ctx->csd_surface, ctx->wl_surface);
+	if(ctx->csd_subsurface == NULL) {
+		printf("wl_subcompositor_get_subsurface: %s\n", strerror(errno));
+		goto err_free_surface;
+	}
+
+	wl_subsurface_set_desync(ctx->csd_subsurface);
+	wl_subsurface_place_below(ctx->csd_subsurface, ctx->wl_surface);
+	wl_subsurface_set_position(ctx->csd_subsurface, 0, -CSDS_HEIGHT);
 
 	wl_surface_add_listener(ctx->wl_surface, &wl_surface_listener, term);
 
 	ctx->xdg_surface = xdg_wm_base_get_xdg_surface(ctx->wm_base, ctx->wl_surface);
 	if(ctx->xdg_surface == NULL) {
 		printf("xdg_wm_base_get_xdg_surface failed: %s\n", strerror(errno));
-		return NULL;
+		goto err_free_surface;
 	}
 	xdg_surface_add_listener(ctx->xdg_surface, &xdg_surface_listener, term);
 
 	ctx->xdg_toplevel = xdg_surface_get_toplevel(ctx->xdg_surface);
+	xdg_toplevel_set_app_id(ctx->xdg_toplevel, "terminal");
+	xdg_toplevel_set_title(ctx->xdg_toplevel, "project-terminal");
 	if(ctx->xdg_surface == NULL) {
 		printf("xdg_surface_get_toplevel failed: %s\n", strerror(errno));
-		return NULL;
+		goto err_free_surface;
 	}
 	xdg_toplevel_add_listener(ctx->xdg_toplevel, &xdg_toplevel_listener, term);
+
+	ctx->csd_buttons[0].label = "X";
+	ctx->csd_buttons[0].anchor = WIDGET_LEFT;
+	ctx->csd_buttons[0].bg = CSD_BG_COLOR;
+	ctx->csd_buttons[0].fg = CSD_FG_COLOR;
+	ctx->csd_buttons[0].hfg = FG_COLOR;
+	ctx->csd_buttons[0].hbg = 0xffff2400;
+	ctx->csd_buttons[0].w = CSDS_HEIGHT;
+	ctx->csd_buttons[0].h = CSDS_HEIGHT;
+	ctx->csd_buttons[0].x = 0;
+	ctx->csd_buttons[0].on_click = button_close_clicked;
+	ctx->csd_buttons[0].data = term;
+
+	ctx->csd_buttons[1].label = "M";
+	ctx->csd_buttons[1].anchor = WIDGET_LEFT;
+	ctx->csd_buttons[1].bg = CSD_BG_COLOR;
+	ctx->csd_buttons[1].fg = CSD_FG_COLOR;
+	ctx->csd_buttons[1].hfg = FG_COLOR;
+	ctx->csd_buttons[1].hbg = 0xff008080;
+	ctx->csd_buttons[1].w = CSDS_HEIGHT;
+	ctx->csd_buttons[1].h = CSDS_HEIGHT;
+	ctx->csd_buttons[1].x = CSDS_HEIGHT;
+	ctx->csd_buttons[1].on_click = button_maxmised_clicked;
+	ctx->csd_buttons[1].data = term;
+
+	ctx->csd_buttons[2].label = "-";
+	ctx->csd_buttons[2].anchor = WIDGET_LEFT;
+	ctx->csd_buttons[2].bg = CSD_BG_COLOR;
+	ctx->csd_buttons[2].fg = CSD_FG_COLOR;
+	ctx->csd_buttons[2].hfg = FG_COLOR;
+	ctx->csd_buttons[2].hbg = 0xffffe135;
+	ctx->csd_buttons[2].w = CSDS_HEIGHT;
+	ctx->csd_buttons[2].h = CSDS_HEIGHT;
+	ctx->csd_buttons[2].x = CSDS_HEIGHT * 2;
+	ctx->csd_buttons[2].on_click = button_minimized_clicked;
+	ctx->csd_buttons[2].data = term;
+
+	ctx->csd_title.anchor = WIDGET_CENTER;
+	ctx->csd_title.label = "project-terminal";
 
 	ctx->height = 600;
 	ctx->width = 800;
@@ -892,8 +1218,11 @@ err_free_surface:
 	if(ctx->xdg_toplevel) xdg_toplevel_destroy(ctx->xdg_toplevel);
 	if(ctx->xdg_surface) xdg_surface_destroy(ctx->xdg_surface);
 	if(ctx->wl_surface) wl_surface_destroy(ctx->wl_surface);
+	if(ctx->csd_subsurface) wl_subsurface_destroy(ctx->csd_subsurface);
+	if(ctx->csd_surface) wl_surface_destroy(ctx->csd_surface);
 
 err_free_globals:
+	if(ctx->subcompositor) wl_subcompositor_destroy(ctx->subcompositor);
 	if(ctx->compositor) wl_compositor_destroy(ctx->compositor);
 	if(ctx->seat) wl_seat_destroy(ctx->seat);
 	if(ctx->shm) wl_shm_destroy(ctx->shm);
@@ -909,6 +1238,8 @@ err_free_ctx:
 void wayland_deinit(wayland_ctx_t *wl) {
 	wl_surface_attach(wl->wl_surface, NULL, 0, 0);
 	wl_surface_commit(wl->wl_surface);
+	wl_surface_attach(wl->csd_surface, NULL, 0, 0);
+	wl_surface_commit(wl->csd_surface);
 	wl_display_roundtrip(wl->display);
 	wl_display_roundtrip(wl->display);
 
@@ -920,8 +1251,11 @@ void wayland_deinit(wayland_ctx_t *wl) {
 	xdg_surface_destroy(wl->xdg_surface);
 	xdg_wm_base_destroy(wl->wm_base);
 	wl_surface_destroy(wl->wl_surface);
+	wl_subsurface_destroy(wl->csd_subsurface);
+	wl_surface_destroy(wl->csd_surface);
 
 	wl_seat_destroy(wl->seat);
+	wl_subcompositor_destroy(wl->subcompositor);
 	wl_compositor_destroy(wl->compositor);
 	wl_shm_destroy(wl->shm);
 
