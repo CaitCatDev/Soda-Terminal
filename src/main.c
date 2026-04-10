@@ -1,4 +1,3 @@
-#include <asm-generic/ioctls.h>
 #define _XOPEN_SOURCE 600
 
 #include <stdio.h>
@@ -28,6 +27,10 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_ADVANCES_H
+
+#include <hb.h>
+#include <hb-ft.h>
 
 #include <fontconfig/fontconfig.h>
 
@@ -40,6 +43,11 @@
 #define COLUMN_MAX 100
 #define BG_COLOR 0xff000000
 #define FG_COLOR 0xf8f8f8f2
+#define UTF8_ESCAPE 0x1b
+#define CURSOR_HOME_STR "[H"
+#define CLEAR_SCREEN_STR "[2J"
+
+#define IN_RANGE(x, l, h) (x >= l && x <= h)
 
 typedef struct wayland_ctx_s {
 	struct wl_display *display;
@@ -64,6 +72,9 @@ typedef struct term_ctx_s {
 	FT_Library library;
 	FT_Face face;
 	uint32_t advance;
+	hb_font_t *hb_font;
+	hb_feature_t features[1];
+	bool disable_harfbuzz;
 
 	struct xkb_context *xkb_ctx;
 	struct xkb_keymap *keymap;
@@ -296,9 +307,8 @@ static uint32_t alpha_blend(uint32_t cnew, uint32_t cdst, float alpha) {
 	return MAKE_ARGB(ro, go, bo);
 }
 
-static void render_char(FT_Face face, uint32_t utf, uint32_t sz, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg) {
-	FT_Set_Pixel_Sizes(face, sz, sz);
-	FT_Load_Char(face, utf, FT_LOAD_DEFAULT);
+static void render_glyph(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg) {
+	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
 	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
 	FT_GlyphSlot glyph = face->glyph;
 
@@ -311,7 +321,11 @@ static void render_char(FT_Face face, uint32_t utf, uint32_t sz, uint32_t x, uin
 				put_pixel(data, x + cx + glyph->bitmap_left, sz + y + cy - glyph->bitmap_top, w, h, px);
 			}
 		}
-	}
+	}}
+
+static void render_char(FT_Face face, uint32_t utf, uint32_t sz, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg) {
+	uint32_t glyph_index = FT_Get_Char_Index(face, utf);
+	render_glyph(face, glyph_index, sz, x, y, data, w, h, fg);
 }
 
 void wl_buffer_release(void *data, struct wl_buffer *buffer) {
@@ -321,6 +335,48 @@ void wl_buffer_release(void *data, struct wl_buffer *buffer) {
 static const struct wl_buffer_listener wl_buffer_listener = {
 	.release = wl_buffer_release,
 };
+
+static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t *data) {
+	for(uint32_t i = 0; i < ROW_MAX; i++) {
+		hb_buffer_t *buf = hb_buffer_create();
+		if(hb_buffer_allocation_successful(buf) == false) {
+			printf("hb_buffer_create failed: %s\n", strerror(errno));
+			return -1;
+		}
+		hb_buffer_add_utf32(buf, ctx->screen[i], -1, 0, -1);
+		hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
+		hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
+		hb_buffer_set_language(buf, hb_language_from_string("en", -1));
+
+		hb_shape(ctx->hb_font, buf, ctx->features, 1);
+		unsigned int glyph_count = 0;
+		hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, &glyph_count);
+		hb_glyph_position_t *glyph_pos = hb_buffer_get_glyph_positions(buf, &glyph_count);
+		for(uint32_t j = 0; j < glyph_count; j++) {
+			hb_codepoint_t glyphid = glyph_info[j].codepoint;
+			hb_position_t x_offset  = glyph_pos[j].x_offset >> 6;
+			hb_position_t y_offset  = glyph_pos[j].y_offset >> 6;
+			hb_position_t x_advance = glyph_pos[j].x_advance >> 6;
+			hb_position_t y_advance = glyph_pos[j].y_advance >> 6;
+			render_glyph(ctx->face, glyphid, 16, j * x_advance, 16 * i, data, width, height, ctx->fg);
+		}
+		hb_buffer_destroy(buf);
+	}
+
+	return 0;
+}
+
+static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t *data) {
+	for(uint32_t y = 0; y < ROW_MAX; ++y) {
+		for(uint32_t x = 0; x < COLUMN_MAX; ++x) {
+			if(ctx->screen[y][x]) {
+				FT_Set_Pixel_Sizes(ctx->face, 16, 16);
+				render_char(ctx->face, ctx->screen[y][x], 16, ctx->advance * x, y * 16, data, width, height, ctx->fg);
+			}
+		}
+	}
+	return 0;
+}
 
 static struct wl_buffer *draw_frame(term_ctx_t *ctx) {
 	struct wl_buffer *buffer = NULL;
@@ -357,13 +413,10 @@ static struct wl_buffer *draw_frame(term_ctx_t *ctx) {
 		}
 	}
 
-	for(uint32_t y = 0; y < ROW_MAX; ++y) {
-		for(uint32_t x = 0; x < COLUMN_MAX; ++x) {
-			if(ctx->screen[y][x]) {
-				FT_Set_Pixel_Sizes(ctx->face, 16, 16);
-				render_char(ctx->face, ctx->screen[y][x], 16, x * ctx->advance, y * 17, data, width, height, ctx->fg);
-			}
-		}
+	if(ctx->disable_harfbuzz) {
+		render_term_text_ft(ctx, width, height, stride, size, data);
+	} else {
+		render_term_text_hb(ctx, width, height, stride, size, data);
 	}
 
 	munmap(data, size);
@@ -502,11 +555,6 @@ void wl_keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint32_t
 
 }
 
-#define CURSOR_HOME_STR "[H"
-#define CLEAR_SCREEN_STR "[2J"
-
-#define IN_RANGE(x, l, h) (x >= l && x <= h)
-
 void handle_csi(term_ctx_t *state) {
 	char escape[128] = { 0 };
 	uint32_t i = 1;
@@ -562,8 +610,6 @@ uint32_t tty_read_utf32(int fd) {
 	return 0;
 }
 
-#define UTF8_ESCAPE 0x1b
-
 void term_event(term_ctx_t *term) {
 	struct pollfd pfd = { term->ptmx, POLLIN, 0 };
 	uint32_t c = 0;
@@ -592,6 +638,9 @@ void term_event(term_ctx_t *term) {
 				continue;
 			}
 			if(c == '\t') {
+				for(uint32_t i = 0; i < 8 - (term->col % 8); ++i) {
+					term->screen[term->row][term->col + i] = ' ';
+				}
 				term->col += 8 - (term->col % 8);
 				continue;
 			}
@@ -904,6 +953,21 @@ int strtou32(const char *str, int base, uint32_t *value) {
 	return 0;
 }
 
+static void usage(const char *arg0) {
+	printf("Usage: %s [OPTIONS]\n", arg0);
+
+	printf("Options:\n");
+	printf("%s%s%s%s%s%s",
+				 "\t--help\tdisplay this message and exit\n",
+				 "\t--font-name\toverride default font name\n",
+				 "\t--bg-color\toverride default bg color\n",
+				 "\t--fg-color\toverride default fg color\n",
+				 "\t--disable-ligatures\tdisable harfbuzz ligatures\n",
+				 "\t--disable-harfbuzz\tdisable all harfbuzz shaping\n");
+
+	return;
+}
+
 int main(int argc, char **argv) {
 	int parent = 0;
 	int child = 0;
@@ -917,14 +981,22 @@ int main(int argc, char **argv) {
 	term->bg = BG_COLOR;
 	term->fg = FG_COLOR;
 
+	term->features[0].tag = HB_TAG('c', 'a', 'l', 't');
+	term->features[0].value = 1;
+	term->features[0].start = HB_FEATURE_GLOBAL_START;
+	term->features[0].end = HB_FEATURE_GLOBAL_END;
+
 	for(int i = 1; i < argc; ++i) {
-		if(strcmp(argv[i], "--font-name") == 0) {
+		if(strcmp(argv[i], "--help") == 0) {
+			usage(argv[0]);
+			return -1;
+		} else if(strcmp(argv[i], "--font-name") == 0) {
 			if(i == argc - 1) {
 				printf("Argument expected for --font-name\n");
 				goto err_free_term;
 			}
 			font_name = argv[i+1];
-		} else if (strcmp(argv[i], "--bg-color") == 0) {
+		} else if(strcmp(argv[i], "--bg-color") == 0) {
 			if(i == argc - 1) {
 				printf("Argument expected for --bg-color\n");
 				goto err_free_term;
@@ -933,7 +1005,7 @@ int main(int argc, char **argv) {
 				printf("error strtou32: %s\n", strerror(errno));
 				goto err_free_term;
 			}
-		} else if (strcmp(argv[i], "--fg-color") == 0) {
+		} else if(strcmp(argv[i], "--fg-color") == 0) {
 			if(i == argc - 1) {
 				printf("Argument expected for --fg-color\n");
 				goto err_free_term;
@@ -942,6 +1014,10 @@ int main(int argc, char **argv) {
 				printf("error strtou32: %s\n", strerror(errno));
 				goto err_free_term;
 			}
+		} else if(strcmp(argv[i], "--disable-harfbuzz") == 0) {
+			term->disable_harfbuzz = true;
+		} else if (strcmp(argv[i], "--disable-ligatures") == 0) {
+			term->features[0].value = 0;
 		}
 	}
 
@@ -965,9 +1041,11 @@ int main(int argc, char **argv) {
 		printf("Freetype Library Init failed %s\n", FT_Error_String(error));
 		goto err_free_freetype;
 	}
-
 	FT_Set_Pixel_Sizes(term->face, 16, 16);
-	term->advance = (uint32_t)(term->face->size->metrics.max_advance >> 6);
+	term->advance = term->face->size->metrics.max_advance >> 6;
+
+	term->hb_font = hb_ft_font_create_referenced(term->face);
+	hb_ft_font_set_load_flags(term->hb_font, FT_LOAD_DEFAULT);
 
 	if(getpty(&parent, &child) == -1) {
 		printf("getpty failed: %s\n", strerror(errno));
@@ -1024,6 +1102,8 @@ int main(int argc, char **argv) {
 	}
 
 	wayland_deinit(term->wl);
+	hb_font_destroy(term->hb_font);
+
 	FT_Done_Face(term->face);
 	FT_Done_FreeType(term->library);
 	if(term->state) {
