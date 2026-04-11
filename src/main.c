@@ -56,6 +56,9 @@
 #define CSD_BG_COLOR 0xffd3d3d3
 #define CSD_FG_COLOR 0xff000000
 #define UTF8_ESCAPE 0x1b
+
+#define CURSOR_MOVE_RIGHT "[C"
+#define CURSOR_CLEAR_INLINE "[K"
 #define CURSOR_HOME_STR "[H"
 #define CLEAR_SCREEN_STR "[2J"
 #define CSDS_HEIGHT 20
@@ -65,6 +68,26 @@
 #define WIDGET_LEFT 0
 #define WIDGET_RIGHT 1
 #define WIDGET_CENTER 2
+
+typedef uint32_t utf32_t;
+
+static const uint32_t term_pallete[] = {
+	0xff000000,
+	0xffff0000,
+	0xff00ff00,
+	0xffffff00,
+	0xff0000ff,
+	0xffff00ff,
+	0xff00ffff,
+	0xffffffff,
+};
+
+typedef struct {
+	utf32_t utf32;
+	uint32_t fg;
+	uint32_t bg;
+	uint32_t attributes;
+} term_cell_t;
 
 typedef struct {
 	int32_t x, y;
@@ -133,11 +156,14 @@ typedef struct term_ctx_s {
 
 	wayland_ctx_t *wl;
 	/*Hardcoded to 30rows 100cols*/
-	uint32_t screen[ROW_MAX][COLUMN_MAX];
+	term_cell_t screen[ROW_MAX][COLUMN_MAX];
 	uint32_t col;
 	uint32_t row;
 	uint32_t fg;
 	uint32_t bg;
+	utf32_t cursor;
+	uint32_t def_fg;
+	uint32_t def_bg;
 } term_ctx_t;
 
 const char *find_font_file(const char *name) {
@@ -239,11 +265,11 @@ int getpty(int *parent, int *child) {
 	return 0;
 }
 
-#define SHELL_PATH "/bin/dash"
+#define SHELL_PATH "/bin/bash"
 
 int forkshell(int parent, int child) {
 	pid_t pid = fork();
-	char *envp[] = { "TERM=xterm", "SHELL=/bin/dash", NULL };
+	char *envp[] = { "TERM=xterm", "SHELL=/bin/bash", NULL };
 
 	if(pid < 0) {
 		printf("error fork: %s\n", strerror(errno));
@@ -372,11 +398,31 @@ static void render_glyph(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32
 				put_pixel(data, x + cx + glyph->bitmap_left, sz + y + cy - glyph->bitmap_top, w, h, px);
 			}
 		}
-	}}
+	}
+}
 
 static void render_char(FT_Face face, uint32_t utf, uint32_t sz, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg) {
 	uint32_t glyph_index = FT_Get_Char_Index(face, utf);
 	render_glyph(face, glyph_index, sz, x, y, data, w, h, fg);
+}
+
+static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32_t x, uint32_t y, term_cell_t *cell, uint32_t *data, uint32_t w, uint32_t h) {
+	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
+	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
+	FT_GlyphSlot glyph = face->glyph;
+
+	for(uint32_t cy = 0; cy < face->size->metrics.height >> 6; cy++) {
+		for(uint32_t cx = 0; cx < face->size->metrics.max_advance >> 6; cx++) {
+			put_pixel(data, x + cx, y + cy, w, h, cell->bg);
+		}
+	}
+	for(uint32_t cy = 0; cy < glyph->bitmap.rows; cy++) {
+		for(uint32_t cx = 0; cx < glyph->bitmap.width; cx++) {
+			float alpha = (float)glyph->bitmap.buffer[cy * glyph->bitmap.pitch + cx] / 255.0f;
+			uint32_t px = alpha_blend(cell->fg, cell->bg, alpha);
+			put_pixel(data, x + cx + glyph->bitmap_left, sz + y + cy - glyph->bitmap_top, w, h, px);
+		}
+	}
 }
 
 void wl_buffer_release(void *data, struct wl_buffer *buffer) {
@@ -394,7 +440,10 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 			printf("hb_buffer_create failed: %s\n", strerror(errno));
 			return -1;
 		}
-		hb_buffer_add_utf32(buf, ctx->screen[i], -1, 0, -1);
+		for(uint32_t x = 0; x < COLUMN_MAX; x++) {
+			if(ctx->screen[i][x].utf32 == 0) break;
+			hb_buffer_add_utf32(buf, &ctx->screen[i][x].utf32, 1, 0, -1);
+		}
 		hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
 		hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
 		hb_buffer_set_language(buf, hb_language_from_string("en", -1));
@@ -409,7 +458,7 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 			hb_position_t y_offset  = glyph_pos[j].y_offset >> 6;
 			hb_position_t x_advance = glyph_pos[j].x_advance >> 6;
 			hb_position_t y_advance = glyph_pos[j].y_advance >> 6;
-			render_glyph(ctx->face, glyphid, 16, j * x_advance, 16 * i, data, width, height, ctx->fg);
+			render_term_cell(ctx->face, glyphid, 16, j * x_advance, 20 * i, &ctx->screen[i][j], data, width, height);
 		}
 		hb_buffer_destroy(buf);
 	}
@@ -420,9 +469,9 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t *data) {
 	for(uint32_t y = 0; y < ROW_MAX; ++y) {
 		for(uint32_t x = 0; x < COLUMN_MAX; ++x) {
-			if(ctx->screen[y][x]) {
+			if(ctx->screen[y][x].utf32) {
 				FT_Set_Pixel_Sizes(ctx->face, 16, 16);
-				render_char(ctx->face, ctx->screen[y][x], 16, ctx->advance * x, y * 16, data, width, height, ctx->fg);
+				render_char(ctx->face, ctx->screen[y][x].utf32, 16, ctx->advance * x, y * 16, data, width, height, ctx->fg);
 			}
 		}
 	}
@@ -460,7 +509,7 @@ static struct wl_buffer *draw_frame(term_ctx_t *ctx) {
 
 	for(int32_t y = 0; y < height; ++y) {
 		for(int32_t x = 0; x < width; ++x) {
-			data[y * width + x] = ctx->bg;
+			data[y * width + x] = ctx->def_bg;
 		}
 	}
 
@@ -469,6 +518,8 @@ static struct wl_buffer *draw_frame(term_ctx_t *ctx) {
 	} else {
 		render_term_text_hb(ctx, width, height, stride, size, data);
 	}
+
+	render_char(ctx->face, ctx->cursor, 16, ctx->advance * ctx->col, ctx->row * 20, data, width, height, ctx->fg);
 
 	munmap(data, size);
 	wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
@@ -716,6 +767,17 @@ void wl_keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint32_t
 
 }
 
+void term_clear_screen(term_ctx_t *ctx) {
+	for(uint32_t y = 0; y < ROW_MAX; y++) {
+		for(uint32_t x = 0; x < COLUMN_MAX; x++) {
+			ctx->screen[y][x].utf32 = 0;
+			ctx->screen[y][x].attributes = 0;
+			ctx->screen[y][x].fg = ctx->fg;
+			ctx->screen[y][x].bg = ctx->bg;
+		}
+	}
+}
+
 void handle_csi(term_ctx_t *state) {
 	char escape[128] = { 0 };
 	uint32_t i = 1;
@@ -726,17 +788,61 @@ void handle_csi(term_ctx_t *state) {
 		i++;
 	} while(i < 127 && !IN_RANGE(escape[i-1], 0x40, 0x7f));
 
-	if(strcmp(CURSOR_HOME_STR, escape) == 0) {
-		state->col = 0;
-		state->row = 0;
+
+	if(escape[i-1] == 'n') {
+		if(escape[i-2] == '6') {
+			write(state->ptmx, "\x1b[0;0R", 6);
+		} else if(escape[i-2] == '5') {
+			write(state->ptmx, "\x1b[0n", 4);
+		}
+		return;
+	} else if(escape[i-1] == 'H') {
+		uint32_t r = strtoul(&escape[1], NULL, 10);
+		uint32_t c = strtoul(&escape[strcspn(escape, ";")+1], NULL, 10);
+		state->row = r;
+		state->col = c;
+	} else if(escape[i-1] == 'm') {
+		uint32_t i = strtoul(&escape[1], NULL, 10);
+		if(i >= 30 && i <= 37) {
+			i -= 30;
+			state->fg = term_pallete[i];
+		} else if(i >= 40 && i <= 47) {
+			i -= 40;
+			state->bg = term_pallete[i];
+		} else {
+			state->screen[state->row][state->col].fg = state->def_fg;
+			state->screen[state->row][state->col].bg = state->def_bg;
+			state->screen[state->row][state->col].attributes = 0;
+		}
 	} else if(strcmp(CLEAR_SCREEN_STR, escape) == 0) {
 		for(uint32_t y = 0; y < ROW_MAX; y++) {
-			memset(state->screen[y], 0, COLUMN_MAX*sizeof(uint32_t));
+			term_clear_screen(state);
+		}
+	} else if(strcmp(CURSOR_MOVE_RIGHT, escape) == 0) {
+		state->col++;
+	} else if(strcmp(CURSOR_CLEAR_INLINE, escape) == 0) {
+		for(uint32_t i = state->col; i < COLUMN_MAX; i++) {
+			state->screen[state->row][i].utf32 = 0;
 		}
 	} else {
-		fprintf(stderr, "Unknown Escape Sequence: %s\n", escape);
+		printf("Unknown Escape Sequence: %s\n", escape);
 	}
 }
+
+void handle_strescape(term_ctx_t *state, char byte) {
+	char escape[4096] = { 0 };
+	uint32_t i = 1;
+	escape[0] = byte;
+
+	do {
+		read(state->ptmx, &escape[i], 1);
+		if(escape[i] == '\a') break;
+		if(strcmp(&escape[i-1], "\x1b\\") == 0) break;
+		i++;
+	} while(i < 4095);
+	printf("Unknown Escape Sequence: %s\n", escape);
+}
+
 
 void process_escape(term_ctx_t *state) {
 	char escape = 0;
@@ -744,6 +850,13 @@ void process_escape(term_ctx_t *state) {
 	read(state->ptmx, &escape, 1);
 	if(escape == '[') {
 		handle_csi(state);
+		return;
+	} else if(escape == ']' || escape == 'P') {
+		handle_strescape(state, escape);
+		return;
+	} else if(escape == '(') {
+		read(state->ptmx, &escape, 1);
+		printf("Unknown Escape Sequence: \\x1b(%c\n", escape);
 		return;
 	}
 	printf("Unknown Escape Format: \\x1b%c\n", escape);
@@ -788,11 +901,11 @@ void term_event(term_ctx_t *term) {
 			}
 			if(term->row >= ROW_MAX) {
 				for(uint32_t i = 1; i < ROW_MAX; i++) {
-					memcpy(term->screen[i-1], term->screen[i], COLUMN_MAX * 4);
+					memcpy(term->screen[i-1], term->screen[i], COLUMN_MAX * sizeof(term_cell_t));
 				}
 				term->row = ROW_MAX - 1;
 				term->col = 0;
-				memset(term->screen[term->row], 0, COLUMN_MAX * 4);
+				memset(term->screen[term->row], 0, COLUMN_MAX * sizeof(term_cell_t));
 			}
 			if(c == UTF8_ESCAPE) {
 				process_escape(term);
@@ -800,7 +913,7 @@ void term_event(term_ctx_t *term) {
 			}
 			if(c == '\t') {
 				for(uint32_t i = 0; i < 8 - (term->col % 8); ++i) {
-					term->screen[term->row][term->col + i] = ' ';
+					term->screen[term->row][term->col + i].utf32 = ' ';
 				}
 				term->col += 8 - (term->col % 8);
 				continue;
@@ -822,7 +935,9 @@ void term_event(term_ctx_t *term) {
 				continue;
 			}
 
-			term->screen[term->row][term->col] = c;
+			term->screen[term->row][term->col].utf32 = c;
+			term->screen[term->row][term->col].fg = term->fg;
+			term->screen[term->row][term->col].bg = term->bg;
 			term->col++;
 		}
 		c = 0;
@@ -847,8 +962,16 @@ void term_event(term_ctx_t *term) {
 	wl_surface_commit(term->wl->wl_surface);
 }
 
+static void send_csi(int ptmx, char c) {
+	char buffer[3] = "\x1b[0";
+
+	buffer[2] = c;
+	write(ptmx, buffer, sizeof(buffer));
+}
+
 void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
 	term_ctx_t *term = data;
+	xkb_keysym_t keysym = 0;
 	char utf8[5] = { 0 };
 	key += 8;
 
@@ -856,13 +979,24 @@ void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t s
 		return;
 	}
 
-	/*Convert to UTF8*/
-	xkb_state_key_get_utf8(term->state, key, utf8, 5);
-	if(utf8[0] == 8) {
-		utf8[0] = 127;
-	}
+	keysym = xkb_state_key_get_one_sym(term->state, key);
+	if(keysym == XKB_KEY_Up) {
+		send_csi(term->ptmx, 'A');
+	} else if(keysym == XKB_KEY_Down) {
+		send_csi(term->ptmx, 'B');
+	} else if(keysym == XKB_KEY_Left) {
+		send_csi(term->ptmx, 'D');
+	} else if(keysym == XKB_KEY_Right) {
+		send_csi(term->ptmx, 'C');
+	} else {
+		/*Convert to UTF8*/
+		xkb_state_key_get_utf8(term->state, key, utf8, 5);
+		if(utf8[0] == 8) {
+			utf8[0] = 127;
+		}
 
-	write(term->ptmx, utf8, strlen(utf8));
+		write(term->ptmx, utf8, strlen(utf8));
+	}
 }
 
 void wl_keyboard_handle_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
@@ -1314,6 +1448,8 @@ int main(int argc, char **argv) {
 	}
 	term->bg = BG_COLOR;
 	term->fg = FG_COLOR;
+	term->cursor = L'█';
+	term_clear_screen(term);
 
 	term->features[0].tag = HB_TAG('c', 'a', 'l', 't');
 	term->features[0].value = 1;
@@ -1354,6 +1490,9 @@ int main(int argc, char **argv) {
 			term->features[0].value = 0;
 		}
 	}
+
+	term->def_fg = term->fg;
+	term->def_bg = term->bg;
 
 	const char *fname = find_font_file(font_name);
 	if(fname == NULL) {

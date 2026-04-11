@@ -6,7 +6,7 @@ LD=cc
 WL_SCANNER=`pkg-config --variable=wayland_scanner wayland-scanner`
 WL_PROTOCOLS=`pkg-config --variable=pkgdatadir wayland-protocols`
 
-CFLAGS=-O0 -g `pkg-config --cflags fontconfig freetype2 wayland-client xkbcommon harfbuzz`
+CFLAGS=-O0 -g -fsanitize=address `pkg-config --cflags fontconfig freetype2 wayland-client xkbcommon harfbuzz`
 LDFLAGS=`pkg-config --libs fontconfig freetype2 wayland-client xkbcommon harfbuzz`
 
 TARGET=project_term
