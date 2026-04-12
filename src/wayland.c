@@ -67,8 +67,12 @@ void xdg_toplevel_wm_capabilities(void *data, struct xdg_toplevel *toplevel, str
 static const struct xdg_toplevel_listener xdg_toplevel_listener = {
 	.close = xdg_toplevel_close,
 	.configure = xdg_toplevel_configure,
+#if defined(XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION)
 	.wm_capabilities = xdg_toplevel_wm_capabilities,
+#endif
+#if defined(XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION)
 	.configure_bounds = xdg_toplevel_configure_bounds,
+#endif
 };
 
 void xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial) {
@@ -146,7 +150,9 @@ static const struct wl_keyboard_listener wl_keyboard_listener = {
 	.key = wl_keyboard_handle_key,
 	.keymap = wl_keyboard_handle_keymap,
 	.modifiers = wl_keyboard_handle_modifiers,
+#if defined(WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
 	.repeat_info = wl_keyboard_handle_repeat_info,
+#endif
 };
 
 
@@ -196,12 +202,24 @@ static const struct wl_pointer_listener wl_pointer_listener = {
 	.motion = wl_pointer_handle_motion,
 	.button = wl_pointer_handle_button,
 	.axis = wl_pointer_handle_axis,
+#if defined(WL_POINTER_FRAME_SINCE_VERSION)
 	.frame = wl_pointer_handle_frame,
+#endif
+#if defined(WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
 	.axis_source = wl_pointer_handle_axis_source,
+#endif
+#if defined(WL_POINTER_AXIS_STOP_SINCE_VERSION)
 	.axis_stop = wl_pointer_handle_axis_stop,
+#endif
+#if defined(WL_POINTER_AXIS_DISCRETE_SINCE_VERSION)
 	.axis_discrete = wl_pointer_handle_axis_discrete,
+#endif
+#if defined(WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
 	.axis_value120 = wl_pointer_handle_axis_value120,
+#endif
+#if defined(WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION)
 	.axis_relative_direction = wl_pointer_handle_axis_relative_direction,
+#endif
 };
 
 void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
@@ -229,13 +247,17 @@ void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
 	}
 }
 
+#if defined(WL_SEAT_NAME_SINCE_VERSION)
 void wl_seat_name(void *data, struct wl_seat *seat, const char *name) {
 	printf("Seat Name: %s\n", name);
 }
+#endif
 
 static const struct wl_seat_listener wl_seat_listener = {
 	.capabilities = wl_seat_capabilities,
+#if defined(WL_SEAT_NAME_SINCE_VERSION)
 	.name = wl_seat_name,
+#endif
 };
 
 
@@ -305,8 +327,14 @@ int term_wl_display_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 	wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
 
 	wl_surface_attach(wl->surface, buffer, 0, 0);
+#if defined(WL_SURFACE_OFFSET_SINCE_VERSION)
 	wl_surface_offset(wl->surface, 0, 0);
+#endif
+#if defined(WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
 	wl_surface_damage_buffer(wl->surface, 0, 0, width, height);
+#else
+	wl_surface_damage(wl->surface, 0, 0, width, height);
+#endif
 	wl_surface_commit(wl->surface);
 	return 0;
 }
@@ -334,6 +362,36 @@ void term_wl_display_dispatch(term_display_t *dpy) {
 			break;
 		}
 	}
+}
+
+void term_wl_display_deinit(term_display_t *dpy) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
+
+	wl_surface_attach(wl->surface, NULL, 0, 0);
+	wl_display_roundtrip(wl->display);
+
+	xdg_toplevel_destroy(wl->xdg_toplevel);
+	xdg_surface_destroy(wl->xdg_surface);
+	wl_surface_destroy(wl->surface);
+
+	if(wl->keyboard) wl_keyboard_destroy(wl->keyboard);
+	if(wl->pointer) wl_pointer_destroy(wl->pointer);
+
+
+	xdg_wm_base_destroy(wl->wm_base);
+	wl_shm_destroy(wl->shm);
+	wl_compositor_destroy(wl->compositor);
+	wl_subcompositor_destroy(wl->subcompositor);
+	wl_seat_destroy(wl->seat);
+
+	xkb_state_unref(wl->state);
+	xkb_keymap_unref(wl->keymap);
+	xkb_context_unref(wl->ctx);
+
+	wl_registry_destroy(wl->registry);
+
+	wl_display_disconnect(wl->display);
+	free(wl);
 }
 
 term_display_t *term_wl_display_init(void) {
@@ -410,6 +468,7 @@ term_display_t *term_wl_display_init(void) {
 
 	wl->base.dispatch = term_wl_display_dispatch;
 	wl->base.attach_shm = term_wl_display_attach_shm;
+	wl->base.deinit = term_wl_display_deinit;
 
 	return &wl->base;
 

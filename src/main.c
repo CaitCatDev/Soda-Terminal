@@ -973,7 +973,11 @@ int main(int argc, char **argv) {
 		goto err_close_pty;
 	}
 
-	term->dpy = term_wl_display_init();
+	if(getenv("WAYLAND_DISPLAY")) {
+		term->dpy = term_wl_display_init();
+	} else if(getenv("DISPLAY")) {
+		term->dpy = term_x11_display_init();
+	}
 	term->dpy->data = term;
 	term->ptmx = parent;
 	term->running = 1;
@@ -1002,6 +1006,7 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	term->dpy->deinit(term->dpy);
 	hb_font_destroy(term->hb_font);
 
 	FT_Done_Face(term->face);
