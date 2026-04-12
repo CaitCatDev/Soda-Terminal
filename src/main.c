@@ -15,10 +15,6 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include <wayland-util.h>
-#include <wayland-client-core.h>
-#include <wayland-client-protocol.h>
-
 #include <poll.h>
 #include <pwd.h>
 #if defined(__linux__)
@@ -39,6 +35,15 @@
 
 #include <fontconfig/fontconfig.h>
 #include <xkbcommon/xkbcommon.h>
+
+#include <wayland-util.h>
+#include <wayland-client-core.h>
+#include <wayland-client-protocol.h>
+
+#include <xcb/xcb.h>
+#include <xcb/shm.h>
+#include <xcb/xproto.h>
+#include <term/display.h>
 
 #if defined(__FreeBSD__)
 #include <dev/evdev/input-event-codes.h>
@@ -111,34 +116,6 @@ typedef struct widget_label {
 	const char *label;
 } widget_label_t;
 
-typedef struct wayland_ctx_s {
-	struct wl_display *display;
-	struct wl_registry *registry;
-	struct wl_shm *shm;
-	struct wl_compositor *compositor;
-	struct wl_subcompositor *subcompositor;
-	struct xdg_wm_base *wm_base;
-
-	struct wl_surface *csd_surface;
-	struct wl_subsurface *csd_subsurface;
-	widget_label_t csd_title;
-	widget_button_t csd_buttons[3];
-
-	struct wl_surface *wl_surface;
-	struct xdg_surface *xdg_surface;
-	struct xdg_toplevel *xdg_toplevel;
-	int32_t width, height;
-	int32_t size;
-	struct wl_seat *seat;
-	struct wl_keyboard *keyboard;
-	struct wl_pointer *pointer;
-
-	struct wl_surface *focused_surface;
-	bool is_maximized;
-	bool wm_maximize;
-	bool wm_minimize;
-} wayland_ctx_t;
-
 typedef struct term_ctx_s {
 	int ptmx;
 	int running;
@@ -150,11 +127,11 @@ typedef struct term_ctx_s {
 	hb_feature_t features[1];
 	bool disable_harfbuzz;
 
-	struct xkb_context *xkb_ctx;
 	struct xkb_keymap *keymap;
 	struct xkb_state *state;
 
-	wayland_ctx_t *wl;
+	term_display_t *dpy;
+
 	/*Hardcoded to 30rows 100cols*/
 	term_cell_t screen[ROW_MAX][COLUMN_MAX];
 	uint32_t col;
@@ -164,6 +141,8 @@ typedef struct term_ctx_s {
 	utf32_t cursor;
 	uint32_t def_fg;
 	uint32_t def_bg;
+	uint32_t width;
+	uint32_t height;
 } term_ctx_t;
 
 const char *find_font_file(const char *name) {
@@ -265,49 +244,82 @@ int getpty(int *parent, int *child) {
 	return 0;
 }
 
-#define SHELL_PATH "/bin/bash"
+static void child_proc_exec(const struct passwd *pw, char *shell, int fd) {
+	unsetenv("COLUMNS");
+	unsetenv("LINES");
+	setenv("USER", pw->pw_name, 1);
+	setenv("SHELL", shell, 1);
+	setenv("HOME", pw->pw_dir, 1);
+	setenv("TERM", "xterm", 1);
+
+	char *args[2] = { shell, NULL };
+
+	if(setsid() < 0) {
+		printf("error setsid: %s\n", strerror(errno));
+		close(fd);
+		exit(1);
+	}
+
+	if(ioctl(fd, TIOCSCTTY, NULL) == -1) {
+		printf("error ioctl(TIOCSCTTY): %s\n", strerror(errno));
+		close(fd);
+		exit(1);
+	}
+
+	struct termios termios = { 0 };
+	if(tcgetattr(fd, &termios) < 0) {
+		printf("error tcgetattr: %s\n", strerror(errno));
+		close(fd);
+		exit(1);
+	}
+	termios.c_iflag |= IUTF8;
+
+	if(tcsetattr(fd, TCSANOW, &termios) == -1) {
+		printf("error tcsetattr: %s\n", strerror(errno));
+		close(fd);
+		exit(1);
+	}
+
+	dup2(fd, STDIN_FILENO);
+	dup2(fd, STDOUT_FILENO);
+	dup2(fd, STDERR_FILENO);
+	close(fd);
+
+	if(execvp(shell, args) < 0) {
+		printf("error execve: %s\n", strerror(errno));
+		close(fd);
+	}
+	exit(1);
+}
 
 int forkshell(int parent, int child) {
-	pid_t pid = fork();
-	char *envp[] = { "TERM=xterm", "SHELL=/bin/bash", NULL };
+	pid_t pid;
+	char *shell = getenv("SHELL");
+	const struct passwd *pw;
+
+	pw = getpwuid(getuid());
+	if(pw == NULL) {
+		printf("getpwuid failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if(shell == NULL && pw->pw_shell[0]) {
+		shell = pw->pw_shell;
+	}
+
+	if(shell == NULL) {
+		printf("Neither $SHELL or pw->pw_shell have a shell set\n");
+		return -1;
+	}
+
+	pid = fork();
 
 	if(pid < 0) {
 		printf("error fork: %s\n", strerror(errno));
 		return -1;
 	} else if(pid == 0) {
 		close(parent);
-		if(setsid() < 0) {
-			printf("error setsid: %s\n", strerror(errno));
-			close(child);
-			exit(1);
-		}
-
-		if(ioctl(child, TIOCSCTTY, NULL) == -1) {
-			printf("error ioctl(TIOCSCTTY): %s\n", strerror(errno));
-			close(child);
-			exit(1);
-		}
-
-		struct termios termios = { 0 };
-		if(tcgetattr(child, &termios) < 0) {
-			printf("error tcgetattr: %s\n", strerror(errno));
-			exit(1);
-		}
-		termios.c_iflag |= IUTF8;
-
-		if(tcsetattr(child, TCSANOW, &termios) == -1) {
-			printf("error tcsetattr: %s\n", strerror(errno));
-			exit(1);
-		}
-
-		dup2(child, STDIN_FILENO);
-		dup2(child, STDOUT_FILENO);
-		dup2(child, STDERR_FILENO);
-
-		if(execle(SHELL_PATH, "-" SHELL_PATH, NULL, envp) < 0) {
-			printf("error execve: %s\n", strerror(errno));
-		}
-		exit(1);
+		child_proc_exec(pw, shell, child);
 	}
 
 	close(child);
@@ -425,14 +437,6 @@ static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, ui
 	}
 }
 
-void wl_buffer_release(void *data, struct wl_buffer *buffer) {
-	wl_buffer_destroy(buffer);
-}
-
-static const struct wl_buffer_listener wl_buffer_listener = {
-	.release = wl_buffer_release,
-};
-
 static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t *data) {
 	for(uint32_t i = 0; i < ROW_MAX; i++) {
 		hb_buffer_t *buf = hb_buffer_create();
@@ -478,34 +482,25 @@ static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, i
 	return 0;
 }
 
-static struct wl_buffer *draw_frame(term_ctx_t *ctx) {
+static int draw_frame(term_ctx_t *ctx) {
 	struct wl_buffer *buffer = NULL;
 	struct wl_shm_pool *pool = NULL;
-	int32_t width = ctx->wl->width;
-	int32_t height = ctx->wl->height;
+	int32_t width = ctx->width;
+	int32_t height = ctx->height;
 	int32_t stride = width * sizeof(uint32_t);
 	int32_t size = stride * height;
 	uint32_t *data = NULL;
 
 	int fd = allocate_shm_file(size);
 	if(fd < 0) {
-		return NULL;
+		return -1;
 	}
 
 	data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if(data == MAP_FAILED) {
 		close(fd);
-		return NULL;
+		return -1;
 	}
-
-	pool = wl_shm_create_pool(ctx->wl->shm, fd, size);
-	if(!pool) {
-		close(fd);
-		return NULL;
-	}
-	buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
-	wl_shm_pool_destroy(pool);
-	close(fd);
 
 	for(int32_t y = 0; y < height; ++y) {
 		for(int32_t x = 0; x < width; ++x) {
@@ -522,8 +517,7 @@ static struct wl_buffer *draw_frame(term_ctx_t *ctx) {
 	render_char(ctx->face, ctx->cursor, 16, ctx->advance * ctx->col, ctx->row * 20, data, width, height, ctx->fg);
 
 	munmap(data, size);
-	wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
-	return buffer;
+	return fd;
 }
 
 static void draw_button(FT_Face face, widget_button_t *btn, uint32_t *data, int32_t w, int32_t h, int32_t stride) {
@@ -570,201 +564,6 @@ static void draw_label(FT_Face face, widget_label_t *label, void *data, int32_t 
 	for(uint32_t i = 0; label->label[i]; i++) {
 		render_char(face, label->label[i], 16, (x - labelwidth / 2) + i * x_advance, y, data, w, h, fg);
 	}
-}
-
-
-static struct wl_buffer *draw_subsurface_frame(term_ctx_t *ctx) {
-	struct wl_buffer *buffer = NULL;
-	struct wl_shm_pool *pool = NULL;
-	int32_t width = ctx->wl->width;
-	int32_t height = CSDS_HEIGHT;
-	int32_t stride = width * sizeof(uint32_t);
-	int32_t size = stride * height;
-	uint32_t *data = NULL;
-
-	int fd = allocate_shm_file(size);
-	if(fd < 0) {
-		return NULL;
-	}
-
-	data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if(data == MAP_FAILED) {
-		close(fd);
-		return NULL;
-	}
-
-	pool = wl_shm_create_pool(ctx->wl->shm, fd, size);
-	if(!pool) {
-		close(fd);
-		return NULL;
-	}
-	buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
-	wl_shm_pool_destroy(pool);
-	close(fd);
-
-	for(int32_t y = 0; y < height; ++y) {
-		for(int32_t x = 0; x < width; ++x) {
-			data[y * width + x] = CSD_BG_COLOR;
-		}
-	}
-
-	draw_button(ctx->face, &ctx->wl->csd_buttons[0], data, width, height, stride);
-	if(ctx->wl->wm_maximize) {
-		draw_button(ctx->face, &ctx->wl->csd_buttons[1], data, width, height, stride);
-	}
-	if(ctx->wl->wm_minimize) {
-		draw_button(ctx->face, &ctx->wl->csd_buttons[2], data, width, height, stride);
-	}
-
-	draw_label(ctx->face, &ctx->wl->csd_title, data, width, height);
-	munmap(data, size);
-	wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
-	return buffer;
-}
-
-void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
-	term_ctx_t *state = (term_ctx_t*)data;
-
-	state->running = 0;
-}
-
-void xdg_toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height, struct wl_array *states) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-	fprintf(stderr, "Configure: %d %d\n", ctx->wl->width, ctx->wl->height);
-
-	ctx->wl->width = width ? width : 800;
-	ctx->wl->height = height ? height : 600;
-	ctx->wl->height -= CSDS_HEIGHT;
-	/*TODO Change ROW_MAX and COLUMN MAX based on window/font size*/
-	struct winsize wsz = { ROW_MAX, COLUMN_MAX, ctx->wl->width, ctx->wl->height };
-	ioctl(ctx->ptmx, TIOCSWINSZ, &wsz);
-}
-
-void xdg_toplevel_configure_bounds(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height) {
-
-}
-
-void xdg_toplevel_wm_capabilities(void *data, struct xdg_toplevel *toplevel, struct wl_array *caps) {
-	term_ctx_t *ctx = data;
-	printf("wm caps size: %zu %zu\n", caps->size, caps->size / sizeof(uint32_t));
-
-	for(uint32_t i = 0; i < caps->size / sizeof(uint32_t); i++) {
-		if(((uint32_t*)caps->data)[i] == XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE) {
-			ctx->wl->wm_maximize = true;
-		} else if(((uint32_t*)caps->data)[i] == XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE) {
-			ctx->wl->wm_minimize = true;
-		}
-	}
-}
-
-static const struct xdg_toplevel_listener xdg_toplevel_listener = {
-	.close = xdg_toplevel_close,
-	.configure = xdg_toplevel_configure,
-	.wm_capabilities = xdg_toplevel_wm_capabilities,
-	.configure_bounds = xdg_toplevel_configure_bounds,
-};
-
-void xdg_surface_configure(void *data, struct xdg_surface *surface, uint32_t serial) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-	wayland_ctx_t *state = ctx->wl;
-	xdg_surface_ack_configure(surface, serial);
-
-	struct wl_buffer *buffer = draw_frame(ctx);
-	if(buffer == NULL) {
-		printf("draw_frame failed: %s\n", strerror(errno));
-		ctx->running = 0;
-		return;
-	}
-
-	struct wl_buffer *subsurface_buffer = draw_subsurface_frame(ctx);
-	wl_surface_attach(state->csd_surface, subsurface_buffer, 0, 0);
-	wl_surface_offset(state->csd_surface, 0, 0);
-	wl_surface_damage_buffer(state->csd_surface, 0, 0, state->width, CSDS_HEIGHT);
-	wl_surface_commit(state->csd_surface);
-
-	wl_surface_attach(state->wl_surface, buffer, 0, 0);
-	wl_surface_offset(state->wl_surface, 0, 0);
-	wl_surface_damage_buffer(state->wl_surface, 0, 0, state->width, state->height);
-	wl_surface_commit(state->wl_surface);
-}
-
-static const struct xdg_surface_listener xdg_surface_listener = {
-	.configure = xdg_surface_configure,
-};
-
-void xdg_wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-	xdg_wm_base_pong(wm_base, serial);
-	wl_display_flush(ctx->wl->display);
-}
-
-static const struct xdg_wm_base_listener xdg_wm_base_listener = {
-	.ping = xdg_wm_base_ping,
-};
-
-void wl_surface_enter(void *data, struct wl_surface *surface, struct wl_output *output) {
-}
-
-void wl_surface_leave(void *data, struct wl_surface *surface, struct wl_output *output) {
-}
-
-void wl_surface_preffered_buffer_scale(void *data, struct wl_surface *surface, int32_t facator) {
-
-}
-
-void wl_surface_preffered_buffer_transform(void *data, struct wl_surface *surface, uint32_t transform) {
-
-}
-
-static const struct wl_surface_listener wl_surface_listener = {
-	.enter = wl_surface_enter,
-	.leave = wl_surface_leave,
-	.preferred_buffer_scale = wl_surface_preffered_buffer_scale,
-	.preferred_buffer_transform = wl_surface_preffered_buffer_transform,
-};
-
-void wl_shm_format(void *data, struct wl_shm *shm, uint32_t format) {
-
-}
-
-static const struct wl_shm_listener wl_shm_listener = {
-	.format = wl_shm_format,
-};
-
-void wl_keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int fd, uint32_t size) {
-	term_ctx_t *term = data;
-	if(term->state) {
-		xkb_state_unref(term->state);
-		term->state = NULL;
-	}
-	if(term->keymap) {
-		xkb_keymap_unref(term->keymap);
-		term->keymap = NULL;
-	}
-	if(term->xkb_ctx) {
-		xkb_context_unref(term->xkb_ctx);
-		term->xkb_ctx = NULL;
-	}
-	char *buffer = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-	close(fd);
-	if(buffer == MAP_FAILED) {
-		term->running = 0;
-		return;
-	}
-
-	term->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-	term->keymap = xkb_keymap_new_from_buffer(term->xkb_ctx, buffer, size, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
-	term->state = xkb_state_new(term->keymap);
-
-	munmap(buffer, size);
-}
-
-void wl_keyboard_handle_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
-
-}
-
-void wl_keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface) {
-
 }
 
 void term_clear_screen(term_ctx_t *ctx) {
@@ -943,23 +742,14 @@ void term_event(term_ctx_t *term) {
 		c = 0;
 	}
 
-	struct wl_buffer *buffer = draw_frame(term);
-	if(buffer == NULL) {
+	int fd = draw_frame(term);
+	if(fd == -1) {
 		printf("draw_frame failed: %s\n", strerror(errno));
 		term->running = 0;
 		return;
 	}
-
-	struct wl_buffer *subsurface_buffer = draw_subsurface_frame(term);
-	wl_surface_attach(term->wl->csd_surface, subsurface_buffer, 0, 0);
-	wl_surface_offset(term->wl->csd_surface, 0, 0);
-	wl_surface_damage_buffer(term->wl->csd_surface, 0, 0, term->wl->width, CSDS_HEIGHT);
-	wl_surface_commit(term->wl->csd_surface);
-
-	wl_surface_attach(term->wl->wl_surface, buffer, 0, 0);
-	wl_surface_offset(term->wl->wl_surface, 0, 0);
-	wl_surface_damage_buffer(term->wl->wl_surface, 0, 0, term->wl->width, term->wl->height);
-	wl_surface_commit(term->wl->wl_surface);
+	term->dpy->attach_shm(term->dpy, fd, term->width, term->height, term->width * 4, term->width * 4 * term->height, 0, WL_SHM_FORMAT_ARGB8888);
+	close(fd);
 }
 
 static void send_csi(int ptmx, char c) {
@@ -969,11 +759,25 @@ static void send_csi(int ptmx, char c) {
 	write(ptmx, buffer, sizeof(buffer));
 }
 
-void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+void term_handle_configure(void *data, uint32_t width, uint32_t height) {
+	term_ctx_t *term = data;
+	term->width = width;
+	term->height = height;
+
+	int fd = draw_frame(term);
+	if(fd == -1) {
+		printf("draw_frame failed: %s\n", strerror(errno));
+		term->running = 0;
+		return;
+	}
+	term->dpy->attach_shm(term->dpy, fd, term->width, term->height, term->width * 4, term->width * 4 * term->height, 0, WL_SHM_FORMAT_ARGB8888);
+	close(fd);
+}
+
+void term_handle_key(void *data, uint32_t key, uint32_t state) {
 	term_ctx_t *term = data;
 	xkb_keysym_t keysym = 0;
 	char utf8[5] = { 0 };
-	key += 8;
 
 	if(state == 0) {
 		return;
@@ -999,24 +803,18 @@ void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t s
 	}
 }
 
-void wl_keyboard_handle_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
-	term_ctx_t *ctx = data;
+void term_handle_keymap(void *data, struct xkb_keymap *keymap, struct xkb_state *state) {
+	term_ctx_t *term = data;
 
-	xkb_state_update_mask(ctx->state, depressed, latched, locked, 0, 0, group);
+	term->state = state;
+	term->keymap = keymap;
 }
 
-void wl_keyboard_handle_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
+void term_handle_close(void *data) {
+	term_ctx_t *term = data;
 
+	term->running = 0;
 }
-
-static const struct wl_keyboard_listener wl_keyboard_listener = {
-	.enter = wl_keyboard_handle_enter,
-	.leave = wl_keyboard_handle_leave,
-	.key = wl_keyboard_handle_key,
-	.keymap = wl_keyboard_handle_keymap,
-	.modifiers = wl_keyboard_handle_modifiers,
-	.repeat_info = wl_keyboard_handle_repeat_info,
-};
 
 static int btn_is_in(widget_button_t *btn, int32_t x, int32_t y, int32_t w, int32_t h) {
 	int32_t bx = 0;
@@ -1041,362 +839,6 @@ static int btn_is_in(widget_button_t *btn, int32_t x, int32_t y, int32_t w, int3
 	}
 
 	return 0;
-}
-
-void wl_pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-
-	ctx->wl->focused_surface = surface;
-}
-
-void wl_pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-
-	ctx->wl->focused_surface = NULL;
-}
-
-void wl_pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-	wayland_ctx_t *wl = ctx->wl;
-	bool found = false;
-
-	for(uint32_t i = 0; i < 3; i++) {
-		if(wl->focused_surface == wl->csd_surface && btn_is_in(&ctx->wl->csd_buttons[i], wl_fixed_to_int(x), wl_fixed_to_int(y), wl->width, wl->height) && found == false) {
-			wl->csd_buttons[i].is_hovered = true;
-			found = true;
-		} else {
-			wl->csd_buttons[i].is_hovered = false;
-		}
-	}
-
-	struct wl_buffer *subsurface_buffer = draw_subsurface_frame(ctx);
-	wl_surface_attach(wl->csd_surface, subsurface_buffer, 0, 0);
-	wl_surface_offset(wl->csd_surface, 0, 0);
-	wl_surface_damage_buffer(wl->csd_surface, 0, 0, wl->width, CSDS_HEIGHT);
-	wl_surface_commit(wl->csd_surface);
-}
-
-void wl_pointer_handle_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-	wayland_ctx_t *wl = ctx->wl;
-
-	for(uint32_t i = 0; i < 3; i++) {
-		if(wl->csd_buttons[i].is_hovered && wl->csd_buttons[i].on_click && state && button == BTN_LEFT) {
-			wl->csd_buttons[i].on_click(wl->csd_buttons[i].data);
-		}
-	}
-}
-
-void wl_pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
-
-}
-
-void wl_pointer_handle_frame(void *data, struct wl_pointer *pointer) {
-
-}
-
-void wl_pointer_handle_axis_source(void *data, struct wl_pointer *pointer, uint32_t axis_source) {
-
-}
-
-void wl_pointer_handle_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) {
-
-}
-
-void wl_pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {
-
-}
-
-void wl_pointer_handle_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120) {
-
-}
-
-void wl_pointer_handle_axis_relative_direction(void *data, struct wl_pointer *pointer, uint32_t axis, uint32_t direction) {
-
-}
-
-static const struct wl_pointer_listener wl_pointer_listener = { 
-	.enter = wl_pointer_handle_enter,
-	.leave = wl_pointer_handle_leave,
-	.motion = wl_pointer_handle_motion,
-	.button = wl_pointer_handle_button,
-	.axis = wl_pointer_handle_axis,
-	.frame = wl_pointer_handle_frame,
-	.axis_source = wl_pointer_handle_axis_source,
-	.axis_stop = wl_pointer_handle_axis_stop,
-	.axis_discrete = wl_pointer_handle_axis_discrete,
-	.axis_value120 = wl_pointer_handle_axis_value120,
-	.axis_relative_direction = wl_pointer_handle_axis_relative_direction,
-};
-
-void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-	wayland_ctx_t *state = ctx->wl;
-	printf("Seat Caps: %x\n", caps);
-
-	if(caps & WL_SEAT_CAPABILITY_KEYBOARD) {
-		if(state->keyboard == NULL) {
-			state->keyboard = wl_seat_get_keyboard(seat);
-			wl_keyboard_add_listener(state->keyboard, &wl_keyboard_listener, data);
-		}
-	} else if(state->keyboard) {
-		wl_keyboard_destroy(state->keyboard);
-		state->keyboard = NULL;
-	}
-
-	if(caps & WL_SEAT_CAPABILITY_POINTER) {
-		if(state->pointer == NULL) {
-			state->pointer = wl_seat_get_pointer(seat);
-			wl_pointer_add_listener(state->pointer, &wl_pointer_listener, data);
-		}
-	} else if(state->pointer) {
-		wl_pointer_destroy(state->pointer);
-		state->pointer = NULL;
-	}
-}
-
-void wl_seat_name(void *data, struct wl_seat *seat, const char *name) {
-	printf("Seat Name: %s\n", name);
-}
-
-static const struct wl_seat_listener wl_seat_listener = {
-	.capabilities = wl_seat_capabilities,
-	.name = wl_seat_name,
-};
-
-void wl_registry_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-	wayland_ctx_t *state = ctx->wl;
-	if(strcmp(interface, wl_compositor_interface.name) == 0) {
-		state->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, version);
-	} else if(strcmp(interface, wl_shm_interface.name) == 0) {
-		state->shm = wl_registry_bind(registry, name, &wl_shm_interface, version);
-		wl_shm_add_listener(state->shm, &wl_shm_listener, ctx);
-	} else if(strcmp(interface, wl_seat_interface.name) == 0) {
-		state->seat = wl_registry_bind(registry, name, &wl_seat_interface, version);
-		wl_seat_add_listener(state->seat, &wl_seat_listener, ctx);
-	} else if(strcmp(interface, wl_subcompositor_interface.name) == 0) {
-		state->subcompositor = wl_registry_bind(registry, name, &wl_subcompositor_interface, version);
-	} else if(strcmp(interface, xdg_wm_base_interface.name) == 0) {
-		state->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, version);
-		xdg_wm_base_add_listener(state->wm_base, &xdg_wm_base_listener, ctx);
-	}
-}
-
-void wl_registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
-
-}
-
-static const struct wl_registry_listener wl_registry_listener = {
-	.global = wl_registry_global,
-	.global_remove = wl_registry_global_remove,
-};
-
-static void button_close_clicked(void *data) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-
-	ctx->running = 0;
-}
-
-static void button_maxmised_clicked(void *data) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-
-	if(ctx->wl->is_maximized == true) {
-		xdg_toplevel_unset_maximized(ctx->wl->xdg_toplevel);
-		ctx->wl->is_maximized = false;
-	} else {
-		xdg_toplevel_set_maximized(ctx->wl->xdg_toplevel);
-		ctx->wl->is_maximized = true;
-	}
-}
-
-static void button_minimized_clicked(void *data) {
-	term_ctx_t *ctx = (term_ctx_t*)data;
-
-	xdg_toplevel_set_minimized(ctx->wl->xdg_toplevel);
-}
-
-wayland_ctx_t *wayland_init(term_ctx_t *term) {
-	wayland_ctx_t *ctx = calloc(1, sizeof(wayland_ctx_t));
-	if(ctx == NULL) {
-		return NULL;
-	}
-	term->wl = ctx;
-
-	ctx->display = wl_display_connect(NULL);
-	if(ctx->display == NULL) {
-		printf("wl_display_connect failed: %s\n", strerror(errno));
-		goto err_free_ctx;
-	}
-
-	ctx->registry = wl_display_get_registry(ctx->display);
-	if(ctx->registry == NULL) {
-		printf("wl_display_get_registry failed: %s\n", strerror(errno));
-		goto err_disconnect;
-	}
-	wl_registry_add_listener(ctx->registry, &wl_registry_listener, term);
-
-	if(wl_display_roundtrip(ctx->display) == -1) {
-		printf("wl_display_roundtrip failed: %s\n", strerror(errno));
-		goto err_free_globals;
-	}
-
-	if(ctx->compositor == NULL) {
-		printf("no wl_compositor is a compositor running?\n");
-		goto err_free_globals;
-	}
-
-	if(ctx->subcompositor == NULL) {
-		printf("No wl_subcompositor\n");
-		goto err_free_globals;
-	}
-
-	if(ctx->seat == NULL) {
-		printf("No wl_seat\n");
-		goto err_free_globals;
-	}
-
-	if(ctx->wm_base == NULL) {
-		printf("No xdg_wm_base\n");
-		goto err_free_globals;
-	}	
-
-	if(ctx->shm == NULL) {
-		printf("No wl_shm\n");
-		goto err_free_globals;
-	}
-
-	ctx->wl_surface = wl_compositor_create_surface(ctx->compositor);
-	if(ctx->wl_surface == NULL) {
-		printf("wl_compositor_create_surface failed: %s\n", strerror(errno));
-		goto err_free_globals;
-	}
-	ctx->csd_surface = wl_compositor_create_surface(ctx->compositor);
-	if(ctx->csd_surface == NULL) {
-		printf("wl_compositor_create_surface failed: %s\n", strerror(errno));
-		goto err_free_surface;
-	}
-
-	ctx->csd_subsurface = wl_subcompositor_get_subsurface(ctx->subcompositor, ctx->csd_surface, ctx->wl_surface);
-	if(ctx->csd_subsurface == NULL) {
-		printf("wl_subcompositor_get_subsurface: %s\n", strerror(errno));
-		goto err_free_surface;
-	}
-
-	wl_subsurface_set_desync(ctx->csd_subsurface);
-	wl_subsurface_place_below(ctx->csd_subsurface, ctx->wl_surface);
-	wl_subsurface_set_position(ctx->csd_subsurface, 0, -CSDS_HEIGHT);
-
-	wl_surface_add_listener(ctx->wl_surface, &wl_surface_listener, term);
-
-	ctx->xdg_surface = xdg_wm_base_get_xdg_surface(ctx->wm_base, ctx->wl_surface);
-	if(ctx->xdg_surface == NULL) {
-		printf("xdg_wm_base_get_xdg_surface failed: %s\n", strerror(errno));
-		goto err_free_surface;
-	}
-	xdg_surface_add_listener(ctx->xdg_surface, &xdg_surface_listener, term);
-
-	ctx->xdg_toplevel = xdg_surface_get_toplevel(ctx->xdg_surface);
-	xdg_toplevel_set_app_id(ctx->xdg_toplevel, "terminal");
-	xdg_toplevel_set_title(ctx->xdg_toplevel, "project-terminal");
-	if(ctx->xdg_surface == NULL) {
-		printf("xdg_surface_get_toplevel failed: %s\n", strerror(errno));
-		goto err_free_surface;
-	}
-	xdg_toplevel_add_listener(ctx->xdg_toplevel, &xdg_toplevel_listener, term);
-
-	ctx->csd_buttons[0].label = "X";
-	ctx->csd_buttons[0].anchor = WIDGET_LEFT;
-	ctx->csd_buttons[0].bg = CSD_BG_COLOR;
-	ctx->csd_buttons[0].fg = CSD_FG_COLOR;
-	ctx->csd_buttons[0].hfg = FG_COLOR;
-	ctx->csd_buttons[0].hbg = 0xffff2400;
-	ctx->csd_buttons[0].w = CSDS_HEIGHT;
-	ctx->csd_buttons[0].h = CSDS_HEIGHT;
-	ctx->csd_buttons[0].x = 0;
-	ctx->csd_buttons[0].on_click = button_close_clicked;
-	ctx->csd_buttons[0].data = term;
-
-	ctx->csd_buttons[1].label = "M";
-	ctx->csd_buttons[1].anchor = WIDGET_LEFT;
-	ctx->csd_buttons[1].bg = CSD_BG_COLOR;
-	ctx->csd_buttons[1].fg = CSD_FG_COLOR;
-	ctx->csd_buttons[1].hfg = FG_COLOR;
-	ctx->csd_buttons[1].hbg = 0xff008080;
-	ctx->csd_buttons[1].w = CSDS_HEIGHT;
-	ctx->csd_buttons[1].h = CSDS_HEIGHT;
-	ctx->csd_buttons[1].x = CSDS_HEIGHT;
-	ctx->csd_buttons[1].on_click = button_maxmised_clicked;
-	ctx->csd_buttons[1].data = term;
-
-	ctx->csd_buttons[2].label = "-";
-	ctx->csd_buttons[2].anchor = WIDGET_LEFT;
-	ctx->csd_buttons[2].bg = CSD_BG_COLOR;
-	ctx->csd_buttons[2].fg = CSD_FG_COLOR;
-	ctx->csd_buttons[2].hfg = FG_COLOR;
-	ctx->csd_buttons[2].hbg = 0xffffe135;
-	ctx->csd_buttons[2].w = CSDS_HEIGHT;
-	ctx->csd_buttons[2].h = CSDS_HEIGHT;
-	ctx->csd_buttons[2].x = CSDS_HEIGHT * 2;
-	ctx->csd_buttons[2].on_click = button_minimized_clicked;
-	ctx->csd_buttons[2].data = term;
-
-	ctx->csd_title.anchor = WIDGET_CENTER;
-	ctx->csd_title.label = "project-terminal";
-
-	ctx->height = 600;
-	ctx->width = 800;
-	return ctx;
-
-err_free_surface:
-	if(ctx->xdg_toplevel) xdg_toplevel_destroy(ctx->xdg_toplevel);
-	if(ctx->xdg_surface) xdg_surface_destroy(ctx->xdg_surface);
-	if(ctx->wl_surface) wl_surface_destroy(ctx->wl_surface);
-	if(ctx->csd_subsurface) wl_subsurface_destroy(ctx->csd_subsurface);
-	if(ctx->csd_surface) wl_surface_destroy(ctx->csd_surface);
-
-err_free_globals:
-	if(ctx->subcompositor) wl_subcompositor_destroy(ctx->subcompositor);
-	if(ctx->compositor) wl_compositor_destroy(ctx->compositor);
-	if(ctx->seat) wl_seat_destroy(ctx->seat);
-	if(ctx->shm) wl_shm_destroy(ctx->shm);
-	if(ctx->wm_base) xdg_wm_base_destroy(ctx->wm_base);
-wl_registry_destroy(ctx->registry);
-err_disconnect:
-	wl_display_disconnect(ctx->display);
-err_free_ctx:
-	free(ctx);
-	return NULL;
-}
-
-void wayland_deinit(wayland_ctx_t *wl) {
-	wl_surface_attach(wl->wl_surface, NULL, 0, 0);
-	wl_surface_commit(wl->wl_surface);
-	wl_surface_attach(wl->csd_surface, NULL, 0, 0);
-	wl_surface_commit(wl->csd_surface);
-	wl_display_roundtrip(wl->display);
-	wl_display_roundtrip(wl->display);
-
-
-	wl_keyboard_destroy(wl->keyboard);
-	wl_pointer_destroy(wl->pointer);
-
-	xdg_toplevel_destroy(wl->xdg_toplevel);
-	xdg_surface_destroy(wl->xdg_surface);
-	xdg_wm_base_destroy(wl->wm_base);
-	wl_surface_destroy(wl->wl_surface);
-	wl_subsurface_destroy(wl->csd_subsurface);
-	wl_surface_destroy(wl->csd_surface);
-
-	wl_seat_destroy(wl->seat);
-	wl_subcompositor_destroy(wl->subcompositor);
-	wl_compositor_destroy(wl->compositor);
-	wl_shm_destroy(wl->shm);
-
-	wl_registry_destroy(wl->registry);
-	wl_display_disconnect(wl->display);
-
-	free(wl);
 }
 
 int strtou32(const char *str, int base, uint32_t *value) {
@@ -1531,63 +973,40 @@ int main(int argc, char **argv) {
 		goto err_close_pty;
 	}
 
+	term->dpy = term_wl_display_init();
+	term->dpy->data = term;
 	term->ptmx = parent;
 	term->running = 1;
-
-	if(wayland_init(term) == NULL) {
-		goto err_close_pty;
-	}
+	term->dpy->callbacks.keymap_change = term_handle_keymap;
+	term->dpy->callbacks.keypress = term_handle_key;
+	term->dpy->callbacks.close = term_handle_close;
+	term->dpy->callbacks.configure = term_handle_configure;
 
 	int ret = 0;
-	struct pollfd pfds[2] = { 0 };
+	struct pollfd pfds[1] = { 0 };
 
 	pfds[0].events = POLLIN;
-	pfds[0].fd = wl_display_get_fd(term->wl->display);
-	pfds[1].events = POLLIN;
-	pfds[1].fd = term->ptmx;
+	pfds[0].fd = term->ptmx;
 
-	wl_surface_commit(term->wl->wl_surface);
-	wl_display_roundtrip(term->wl->display);
+	term->width = 800;
+	term->height = 600;
+
 	while(term->running) {
-		while(wl_display_prepare_read(term->wl->display) != 0) {
-			wl_display_dispatch_pending(term->wl->display);
-		}
-		wl_display_flush(term->wl->display);
-
-		ret = poll(pfds, 2, -1);
+		term->dpy->dispatch(term->dpy);
+		ret = poll(pfds, 1, 0);
 		if(pfds[0].revents & POLLIN) {
-			wl_display_read_events(term->wl->display);
-			wl_display_dispatch_pending(term->wl->display);
-		} else if(pfds[0].revents & (POLLHUP | POLLERR)) {
-			wl_display_cancel_read(term->wl->display);
-			term->running = 0;
-			break;
-		} else {
-			wl_display_cancel_read(term->wl->display);
-		}
-
-		if(pfds[1].revents & POLLIN) {
 			term_event(term);
-		} else if(pfds[1].revents & (POLLHUP | POLLERR)) {
+		} else if(pfds[0].revents & (POLLHUP | POLLERR)) {
 			term->running = 0;
 			break;
 		}
 	}
 
-	wayland_deinit(term->wl);
 	hb_font_destroy(term->hb_font);
 
 	FT_Done_Face(term->face);
 	FT_Done_FreeType(term->library);
-	if(term->state) {
-		xkb_state_unref(term->state);
-	}
-	if(term->keymap) {
-		xkb_keymap_unref(term->keymap);
-	}
-	if(term->xkb_ctx) {
-		xkb_context_unref(term->xkb_ctx);
-	}
+	
 	close(term->ptmx);
 	free(term);
 
