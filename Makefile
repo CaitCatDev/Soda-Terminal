@@ -7,7 +7,7 @@ WL_SCANNER=`pkg-config --variable=wayland_scanner wayland-scanner`
 WL_PROTOCOLS=`pkg-config --variable=pkgdatadir wayland-protocols`
 
 CFLAGS=-O0 -I ./include/ -g -fsanitize=address `pkg-config --cflags fontconfig freetype2 wayland-client xkbcommon harfbuzz`
-LDFLAGS=`pkg-config --libs fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11 harfbuzz xcb xcb-shm`
+LDFLAGS=`pkg-config --libs fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11 harfbuzz xcb xcb-shm xcb-xkb`
 
 TARGET=project_term
 COBJS=./src/main.o ./src/wayland.o ./src/x11.o ./xdg-shell-protocol-code.o

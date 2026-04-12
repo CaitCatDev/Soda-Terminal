@@ -1,3 +1,4 @@
+#include <stdint.h>
 #define _XOPEN_SOURCE 600
 
 #include <sys/mman.h>
@@ -7,12 +8,9 @@
 
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
-
+#include <xcb/xkb.h>
 #include <xcb/shm.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <stddef.h>
+
 
 #include <fcntl.h>
 #include <termios.h>
@@ -44,6 +42,8 @@ typedef struct x11_term_display {
 	uint8_t shm_major;
 	uint8_t shm_event;
 	uint8_t shm_error;
+	uint8_t xkb_event;
+	uint8_t xkb_error;
 
 	xcb_intern_atom_reply_t *close;
 
@@ -108,6 +108,53 @@ static int term_x11_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 	return 0;
 }
 
+static void x11_handle_xkb_event(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_xkb_state_notify_event_t *xkb_ev = (xcb_xkb_state_notify_event_t*)ev;
+
+	switch(xkb_ev->xkbType) {
+		case XCB_XKB_STATE_NOTIFY:
+			xkb_state_update_mask(xcb->state, xkb_ev->baseMods, xkb_ev->latchedMods, xkb_ev->lockedMods, xkb_ev->baseGroup, xkb_ev->latchedGroup, xkb_ev->lockedGroup);
+			break;
+		default:
+			printf("Unhandled XKB Event: %d\n", xkb_ev->xkbType);
+			break;
+	}
+}
+
+static void x11_handle_core_event(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	switch(ev->response_type & ~0x80) {
+		case XCB_KEY_PRESS: {
+			xcb_key_press_event_t *key = (xcb_key_release_event_t*)ev;
+			xcb->base.callbacks.keypress(xcb->base.data, key->detail, 1);
+			break;
+		}	
+		case XCB_KEY_RELEASE: {
+			xcb_key_release_event_t *key = (xcb_key_release_event_t*)ev;
+			xcb->base.callbacks.keypress(xcb->base.data, key->detail, 0);
+			break;
+		}
+		case XCB_CONFIGURE_NOTIFY: {
+			xcb_configure_notify_event_t *configure = (xcb_configure_notify_event_t*)ev;
+			xcb->base.callbacks.configure(xcb->base.data, configure->width, configure->height);
+			break;
+		}
+		case XCB_CLIENT_MESSAGE: {
+			if(((xcb_client_message_event_t*)ev)->data.data32[0] == xcb->close->atom && xcb->base.callbacks.close) {
+				xcb->base.callbacks.close(xcb->base.data);
+			}
+			break;
+		}
+		case 0: {
+			xcb_generic_error_t *err = (xcb_generic_error_t*)ev;
+			printf("X11 Error: %d %d.%d\n", err->error_code, err->major_code, err->minor_code);
+			break;
+		}
+		default:
+			__builtin_dump_struct(ev, &printf);
+			break;
+	}
+}
+
 static void term_x11_display_dispatch(term_display_t *dpy) {
 	static uint32_t first_call = 1;
 	xcb_term_display_t *xcb = (xcb_term_display_t*)dpy;
@@ -118,36 +165,11 @@ static void term_x11_display_dispatch(term_display_t *dpy) {
 	}
 
 	while((ev = xcb_poll_for_event(xcb->connection))) {
-		switch(ev->response_type & ~0x80) {
-			case XCB_KEY_PRESS: {
-				xcb_key_press_event_t *key = (xcb_key_release_event_t*)ev;
-				dpy->callbacks.keypress(xcb->base.data, key->detail, 1);
-				break;
-			}	
-			case XCB_KEY_RELEASE: {
-				xcb_key_release_event_t *key = (xcb_key_release_event_t*)ev;
-				dpy->callbacks.keypress(xcb->base.data, key->detail, 0);
-				break;
-			}
-			case XCB_CONFIGURE_NOTIFY: {
-				xcb_configure_notify_event_t *configure = (xcb_configure_notify_event_t*)ev;
-				dpy->callbacks.configure(xcb->base.data, configure->width, configure->height);
-				break;
-			}
-			case XCB_CLIENT_MESSAGE: {
-				if(((xcb_client_message_event_t*)ev)->data.data32[0] == xcb->close->atom && xcb->base.callbacks.close) {
-					xcb->base.callbacks.close(xcb->base.data);
-				}
-				break;
-			}
-			case 0: {
-				xcb_generic_error_t *err = (xcb_generic_error_t*)ev;
-				printf("X11 Error: %d %d.%d\n", err->error_code, err->major_code, err->minor_code);
-				break;
-			}
-			default:
-				__builtin_dump_struct(ev, &printf);
-				break;
+		uint8_t type = ev->response_type & ~0x80;
+		if(type == xcb->xkb_event) {
+			x11_handle_xkb_event(xcb, ev);
+		} else {
+			x11_handle_core_event(xcb, ev);
 		}
 		free(ev);
 	}
@@ -203,11 +225,14 @@ term_display_t *term_x11_display_init(void) {
 	xcb->gc = xcb_generate_id(xcb->connection);
 	xcb_create_gc(xcb->connection, xcb->gc, xcb->window, 0, NULL);
 	xcb_flush(xcb->connection);
-	xkb_x11_setup_xkb_extension(xcb->connection, XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION, 0, NULL, NULL, NULL, NULL);
+	xkb_x11_setup_xkb_extension(xcb->connection, XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION, 0, NULL, NULL, &xcb->xkb_event, &xcb->xkb_error);
 
 	xcb->ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	xcb->keymap = xkb_x11_keymap_new_from_device(xcb->ctx, xcb->connection, xkb_x11_get_core_keyboard_device_id(xcb->connection), XKB_KEYMAP_COMPILE_NO_FLAGS);
 	xcb->state = xkb_x11_state_new_from_device(xcb->keymap, xcb->connection, xkb_x11_get_core_keyboard_device_id(xcb->connection));
+
+	uint16_t xkb_events = XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY | XCB_XKB_EVENT_TYPE_MAP_NOTIFY | XCB_XKB_EVENT_TYPE_STATE_NOTIFY;
+	xcb_xkb_select_events_aux(xcb->connection, XCB_XKB_ID_USE_CORE_KBD, xkb_events, 0, xkb_events, 0, 0, NULL);
 
 	xcb_intern_atom_cookie_t protocol_cookie = xcb_intern_atom_unchecked(xcb->connection, 1, 12, "WM_PROTOCOLS");
 	xcb_intern_atom_reply_t *protocol_reply = xcb_intern_atom_reply(xcb->connection, protocol_cookie, NULL);
