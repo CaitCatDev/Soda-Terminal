@@ -51,7 +51,6 @@
 #include <linux/input-event-codes.h>
 #endif
 
-#include "../xdg-shell-client-protocol.h"
 #include "freetype/freetype.h"
 
 #define ROW_MAX 30
@@ -458,16 +457,15 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 		hb_glyph_position_t *glyph_pos = hb_buffer_get_glyph_positions(buf, &glyph_count);
 		for(uint32_t j = 0; j < glyph_count; j++) {
 			hb_codepoint_t glyphid = glyph_info[j].codepoint;
-			hb_position_t x_offset  = glyph_pos[j].x_offset >> 6;
-			hb_position_t y_offset  = glyph_pos[j].y_offset >> 6;
 			hb_position_t x_advance = glyph_pos[j].x_advance >> 6;
-			hb_position_t y_advance = glyph_pos[j].y_advance >> 6;
 			render_term_cell(ctx->face, glyphid, 16, j * x_advance, 20 * i, &ctx->screen[i][j], data, width, height);
 		}
 		hb_buffer_destroy(buf);
 	}
 
 	return 0;
+	(void)size;
+	(void)stride;
 }
 
 static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t *data) {
@@ -480,11 +478,11 @@ static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, i
 		}
 	}
 	return 0;
+	(void)stride;
+	(void)size;
 }
 
 static int draw_frame(term_ctx_t *ctx) {
-	struct wl_buffer *buffer = NULL;
-	struct wl_shm_pool *pool = NULL;
 	int32_t width = ctx->width;
 	int32_t height = ctx->height;
 	int32_t stride = width * sizeof(uint32_t);
@@ -519,7 +517,7 @@ static int draw_frame(term_ctx_t *ctx) {
 	munmap(data, size);
 	return fd;
 }
-
+/*
 static void draw_button(FT_Face face, widget_button_t *btn, uint32_t *data, int32_t w, int32_t h, int32_t stride) {
 	int32_t x = 0;
 	int32_t y = 0;
@@ -565,7 +563,7 @@ static void draw_label(FT_Face face, widget_label_t *label, void *data, int32_t 
 		render_char(face, label->label[i], 16, (x - labelwidth / 2) + i * x_advance, y, data, w, h, fg);
 	}
 }
-
+*/
 void term_clear_screen(term_ctx_t *ctx) {
 	for(uint32_t y = 0; y < ROW_MAX; y++) {
 		for(uint32_t x = 0; x < COLUMN_MAX; x++) {
@@ -662,7 +660,6 @@ void process_escape(term_ctx_t *state) {
 }
 
 uint32_t tty_read_utf32(int fd) {
-	uint32_t i = 0;
 	uint8_t b1 = 0;
 	uint8_t extbytes[3] = { 0 };
 	read(fd, &b1, 1);
@@ -815,7 +812,7 @@ void term_handle_close(void *data) {
 
 	term->running = 0;
 }
-
+/*
 static int btn_is_in(widget_button_t *btn, int32_t x, int32_t y, int32_t w, int32_t h) {
 	int32_t bx = 0;
 	int32_t by = btn->y;
@@ -840,7 +837,7 @@ static int btn_is_in(widget_button_t *btn, int32_t x, int32_t y, int32_t w, int3
 
 	return 0;
 }
-
+*/
 int strtou32(const char *str, int base, uint32_t *value) {
 	errno = 0;
 	char *end = NULL;
@@ -973,11 +970,22 @@ int main(int argc, char **argv) {
 		goto err_close_pty;
 	}
 
+#if defined(TERM_WL_SUPPORT)
 	if(getenv("WAYLAND_DISPLAY")) {
 		term->dpy = term_wl_display_init();
-	} else if(getenv("DISPLAY")) {
+	}
+#endif
+#if defined(TERM_X11_SUPPORT)
+	if(term->dpy == NULL && getenv("DISPLAY")) {
 		term->dpy = term_x11_display_init();
 	}
+#endif
+
+	if(term->dpy == NULL) {
+		printf("Failed to create display\n");
+		return -1;
+	}
+
 	term->dpy->data = term;
 	term->ptmx = parent;
 	term->running = 1;
@@ -986,7 +994,6 @@ int main(int argc, char **argv) {
 	term->dpy->callbacks.close = term_handle_close;
 	term->dpy->callbacks.configure = term_handle_configure;
 
-	int ret = 0;
 	struct pollfd pfds[1] = { 0 };
 
 	pfds[0].events = POLLIN;
@@ -997,7 +1004,7 @@ int main(int argc, char **argv) {
 
 	while(term->running) {
 		term->dpy->dispatch(term->dpy);
-		ret = poll(pfds, 1, 0);
+		poll(pfds, 1, 0);
 		if(pfds[0].revents & POLLIN) {
 			term_event(term);
 		} else if(pfds[0].revents & (POLLHUP | POLLERR)) {

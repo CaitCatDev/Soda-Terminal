@@ -15,7 +15,9 @@
 
 #include <xkbcommon/xkbcommon.h>
 
-#include "../xdg-shell-client-protocol.h"
+#include <xdg-shell-client-protocol.h>
+
+#define UNUSED(x) (void)x
 
 typedef struct wl_ctx_s {
 	term_display_t base;
@@ -48,6 +50,8 @@ void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
 	if(wl->base.callbacks.close) {
 		wl->base.callbacks.close(wl->base.data);
 	}
+
+	UNUSED(toplevel);
 }
 
 void xdg_toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height, struct wl_array *states) {
@@ -55,13 +59,21 @@ void xdg_toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_t w
 
 	wl->width = width ? width : 800;
 	wl->height = height ? height : 600;
+	UNUSED(toplevel);
+	UNUSED(states);
 }
 
 void xdg_toplevel_configure_bounds(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height) {
-
+	UNUSED(data);
+	UNUSED(toplevel);
+	UNUSED(width);
+	UNUSED(height);
 }
 
 void xdg_toplevel_wm_capabilities(void *data, struct xdg_toplevel *toplevel, struct wl_array *caps) {
+	UNUSED(data);
+	UNUSED(toplevel);
+	UNUSED(caps);
 }
 
 static const struct xdg_toplevel_listener xdg_toplevel_listener = {
@@ -94,6 +106,15 @@ void wl_keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard, uint32_
 	struct xkb_keymap *keymap = NULL;
 	struct xkb_state *state = NULL;
 
+	if(format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+		printf("Unknown keymap format: %d\n", format);
+		close(fd);
+		if(wl->base.callbacks.close) {
+			wl->base.callbacks.close(wl->base.data);
+		}
+		return;
+	}
+
 	char *buffer = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
 	close(fd);
 	if(buffer == MAP_FAILED) {
@@ -115,14 +136,22 @@ void wl_keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard, uint32_
 	}
 	wl->keymap = keymap;
 	wl->state = state;
+	UNUSED(keyboard);
 }
 
 void wl_keyboard_handle_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
-
+	UNUSED(data);
+	UNUSED(keyboard);
+	UNUSED(serial);
+	UNUSED(surface);
+	UNUSED(keys);
 }
 
 void wl_keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface) {
-
+	UNUSED(data);
+	UNUSED(keyboard);
+	UNUSED(serial);
+	UNUSED(surface);
 }
 
 void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
@@ -132,16 +161,24 @@ void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t s
 	if(wl->base.callbacks.keypress) {
 		wl->base.callbacks.keypress(wl->base.data, key, state);
 	}
+	UNUSED(keyboard);
+	UNUSED(serial);
+	UNUSED(time);
 }
 
 void wl_keyboard_handle_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
 	wayland_ctx_t *wl = data;
 
 	xkb_state_update_mask(wl->state, depressed, latched, locked, 0, 0, group);
+	UNUSED(keyboard);
+	UNUSED(serial);
 }
 
 void wl_keyboard_handle_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
-
+	UNUSED(data);
+	UNUSED(keyboard);
+	UNUSED(rate);
+	UNUSED(delay);
 }
 
 static const struct wl_keyboard_listener wl_keyboard_listener = {
@@ -157,43 +194,83 @@ static const struct wl_keyboard_listener wl_keyboard_listener = {
 
 
 void wl_pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(serial);
+	UNUSED(surface);
+	UNUSED(x);
+	UNUSED(y);
 }
 
 void wl_pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface) {
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(serial);
+	UNUSED(surface);
 }
 
 void wl_pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(time);
+	UNUSED(x);
+	UNUSED(y);
 }
 
 void wl_pointer_handle_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(time);
+	UNUSED(button);
+	UNUSED(state);
+	UNUSED(serial);
 }
 
 void wl_pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
-
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(time);
+	UNUSED(axis);
+	UNUSED(value);
 }
 
 void wl_pointer_handle_frame(void *data, struct wl_pointer *pointer) {
-
+	UNUSED(data);
+	UNUSED(pointer);
 }
 
 void wl_pointer_handle_axis_source(void *data, struct wl_pointer *pointer, uint32_t axis_source) {
-
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(axis_source);
 }
 
 void wl_pointer_handle_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) {
-
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(time);
+	UNUSED(axis);
 }
 
 void wl_pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {
-
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(discrete);
+	UNUSED(axis);
 }
 
 void wl_pointer_handle_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120) {
-
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(value120);
+	UNUSED(axis);
 }
 
 void wl_pointer_handle_axis_relative_direction(void *data, struct wl_pointer *pointer, uint32_t axis, uint32_t direction) {
-
+	UNUSED(data);
+	UNUSED(pointer);
+	UNUSED(direction);
+	UNUSED(axis);
 }
 
 static const struct wl_pointer_listener wl_pointer_listener = { 
@@ -250,6 +327,9 @@ void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
 #if defined(WL_SEAT_NAME_SINCE_VERSION)
 void wl_seat_name(void *data, struct wl_seat *seat, const char *name) {
 	printf("Seat Name: %s\n", name);
+
+	UNUSED(data);
+	UNUSED(seat);
 }
 #endif
 
@@ -262,7 +342,9 @@ static const struct wl_seat_listener wl_seat_listener = {
 
 
 void wl_shm_format(void *data, struct wl_shm *shm, uint32_t format) {
-
+	UNUSED(data);
+	UNUSED(shm);
+	UNUSED(format);
 }
 
 static const struct wl_shm_listener wl_shm_listener = {
@@ -298,7 +380,9 @@ void wl_registry_global(void *data, struct wl_registry *registry, uint32_t name,
 }
 
 void wl_registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
-
+	UNUSED(data);
+	UNUSED(registry);
+	UNUSED(name);
 }
 
 static const struct wl_registry_listener wl_registry_listener = {
@@ -308,6 +392,7 @@ static const struct wl_registry_listener wl_registry_listener = {
 
 void wl_buffer_release(void *data, struct wl_buffer *buffer) {
 	wl_buffer_destroy(buffer);
+	UNUSED(data);
 }
 
 static const struct wl_buffer_listener wl_buffer_listener = {
@@ -322,7 +407,7 @@ int term_wl_display_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 		return -1;
 	}
 
-	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
+	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, offset, width, height, stride, format);
 	wl_shm_pool_destroy(pool);
 	wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
 
@@ -340,7 +425,6 @@ int term_wl_display_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 }
 
 void term_wl_display_dispatch(term_display_t *dpy) {
-	int ret = 0;
 	wayland_ctx_t *wl = (wayland_ctx_t *)dpy;
 	struct pollfd pfds[1] = { 0 };
 
@@ -353,7 +437,7 @@ void term_wl_display_dispatch(term_display_t *dpy) {
 		}
 		wl_display_flush(wl->display);
 
-		ret = poll(pfds, 1, 0);
+		poll(pfds, 1, 0);
 		if(pfds[0].revents & POLLIN) {
 			wl_display_read_events(wl->display);
 			wl_display_dispatch_pending(wl->display);

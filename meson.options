@@ -1,0 +1,2 @@
+option('enable-x11', type : 'feature')
+option('enable-wl', type : 'feature')

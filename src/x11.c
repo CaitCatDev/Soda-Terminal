@@ -1,6 +1,4 @@
 #include <stdint.h>
-#define _XOPEN_SOURCE 600
-
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -11,7 +9,6 @@
 #include <xcb/xkb.h>
 #include <xcb/shm.h>
 
-
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -20,6 +17,8 @@
 #include <xkbcommon/xkbcommon-x11.h>
 
 #include <term/display.h>
+
+#define UNUSED(x) (void)x
 
 typedef struct xid_free_list xid_free_list_t;
 
@@ -106,6 +105,9 @@ static int term_x11_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 	xcb_flush(xcb->connection);
 
 	return 0;
+	UNUSED(stride);
+	UNUSED(format);
+	UNUSED(size);
 }
 
 static void x11_handle_xkb_event(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
@@ -150,7 +152,6 @@ static void x11_handle_core_event(xcb_term_display_t *xcb, xcb_generic_event_t *
 			break;
 		}
 		default:
-			__builtin_dump_struct(ev, &printf);
 			break;
 	}
 }
@@ -195,9 +196,9 @@ void term_x11_display_deinit(term_display_t *dpy) {
 }
 
 term_display_t *term_x11_display_init(void) {
-	const xcb_query_extension_reply_t *reply = NULL;
-	int screen_no = 0;
 	xcb_term_display_t *xcb = calloc(1, sizeof(xcb_term_display_t));
+
+	int screen_no = 0;
 
 	xcb->connection = xcb_connect(NULL, &screen_no);
 
@@ -208,7 +209,6 @@ term_display_t *term_x11_display_init(void) {
 	}
 	xcb->screen = iter.data;
 
-	reply = xcb_get_extension_data(xcb->connection, &xcb_shm_id);
 	xcb_shm_query_version_cookie_t cookie = xcb_shm_query_version(xcb->connection);
 	xcb_shm_query_version_reply_t *version = xcb_shm_query_version_reply(xcb->connection, cookie, NULL);
 	if(version->major_version != 1 && version->minor_version < 2) {
