@@ -1,4 +1,3 @@
-#define _XOPEN_SOURCE 600
 #ifdef __FREEBSD__
 #define __BSD_VISIBLE 1
 #endif
@@ -22,7 +21,6 @@
 #endif
 
 #include <sys/mman.h>
-#include <sys/poll.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 
@@ -36,22 +34,18 @@
 #include <fontconfig/fontconfig.h>
 #include <xkbcommon/xkbcommon.h>
 
-#include <wayland-util.h>
-#include <wayland-client-core.h>
-#include <wayland-client-protocol.h>
-
-#include <xcb/xcb.h>
-#include <xcb/shm.h>
-#include <xcb/xproto.h>
 #include <term/display.h>
 
 #if defined(__FreeBSD__)
 #include <dev/evdev/input-event-codes.h>
-#elif defined(__linux__) 
+#elif defined(__linux__)
 #include <linux/input-event-codes.h>
 #endif
 
 #include "freetype/freetype.h"
+
+#define FORMAT_ARGB8888 0
+#define FORMAT_XRGB8888 1
 
 #define ROW_MAX 30
 #define COLUMN_MAX 100
@@ -736,7 +730,6 @@ void term_event(term_ctx_t *term) {
 			term->screen[term->row][term->col].bg = term->bg;
 			term->col++;
 		}
-		c = 0;
 	}
 
 	int fd = draw_frame(term);
@@ -745,12 +738,12 @@ void term_event(term_ctx_t *term) {
 		term->running = 0;
 		return;
 	}
-	term->dpy->attach_shm(term->dpy, fd, term->width, term->height, term->width * 4, term->width * 4 * term->height, 0, WL_SHM_FORMAT_ARGB8888);
+	term->dpy->attach_shm(term->dpy, fd, term->width, term->height, term->width * 4, term->width * 4 * term->height, 0, FORMAT_ARGB8888);
 	close(fd);
 }
 
 static void send_csi(int ptmx, char c) {
-	char buffer[3] = "\x1b[0";
+	char buffer[4] = "\x1b[0";
 
 	buffer[2] = c;
 	write(ptmx, buffer, sizeof(buffer));
@@ -767,7 +760,7 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 		term->running = 0;
 		return;
 	}
-	term->dpy->attach_shm(term->dpy, fd, term->width, term->height, term->width * 4, term->width * 4 * term->height, 0, WL_SHM_FORMAT_ARGB8888);
+	term->dpy->attach_shm(term->dpy, fd, term->width, term->height, term->width * 4, term->width * 4 * term->height, 0, FORMAT_ARGB8888);
 	close(fd);
 }
 
@@ -1023,7 +1016,6 @@ int main(int argc, char **argv) {
 	free(term);
 
 	return 0;
-
 err_close_pty:
 	close(parent);
 err_free_face:

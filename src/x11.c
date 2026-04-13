@@ -46,6 +46,10 @@ typedef struct x11_term_display {
 
 	xcb_intern_atom_reply_t *close;
 
+	xcb_visualid_t visid;
+	xcb_colormap_t colormap;
+	uint8_t bpp;
+
 	xcb_window_t window;
 	xcb_gcontext_t gc;
 } xcb_term_display_t;
@@ -78,7 +82,7 @@ static uint32_t get_xid(xcb_term_display_t *xcb) {
 }
 
 static int xid_free(xcb_term_display_t *xcb, uint32_t id) {
-	xid_free_list_t *new = calloc(1, sizeof(xcb_term_display_t));
+	xid_free_list_t *new = calloc(1, sizeof(xid_free_list_t));
 	if(!new) return -1;
 
 	new->id = id;
@@ -94,7 +98,7 @@ static int term_x11_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 	xcb_shm_attach_fd(xcb->connection, shmseg, dupfd, 0);
 
 	xcb_pixmap_t pixmap = get_xid(xcb);
-	xcb_shm_create_pixmap(xcb->connection, pixmap, xcb->window, width, height, xcb->screen->root_depth, shmseg, offset);
+	xcb_shm_create_pixmap(xcb->connection, pixmap, xcb->window, width, height, 32, shmseg, offset);
 
 	xcb_shm_detach(xcb->connection, shmseg);
 	xid_free(xcb, shmseg);
@@ -190,48 +194,162 @@ void term_x11_display_deinit(term_display_t *dpy) {
 	for(xid_free_list_t *tmp = xcb->free_list; tmp; tmp = next) {
 		next = tmp->next;
 		free(tmp);
-	} 
+	}
 
 	free(xcb);
 }
 
+int x11_match_visual(xcb_screen_t *screen, uint8_t bpp, uint8_t class, uint32_t *vid) {
+	xcb_visualtype_iterator_t visual_iter;
+	xcb_depth_iterator_t depth_iter = xcb_screen_allowed_depths_iterator(screen);
+	xcb_visualtype_t *visual = NULL;
+	xcb_depth_t *depth = NULL;
+
+	int found = 0;
+	for(; depth_iter.rem; xcb_depth_next(&depth_iter)) {
+		if(depth_iter.data->depth == bpp) {
+			found = 1;
+			break;
+		}
+	}
+	depth = depth_iter.data;
+	if(!found || depth_iter.data->visuals_len == 0) return -1;
+
+	found = 0;
+	visual_iter = xcb_depth_visuals_iterator(depth);
+	for(; visual_iter.rem; xcb_visualtype_next(&visual_iter)) {
+		if(visual_iter.data->_class == class) {
+			found = 1;
+			break;
+		}
+	}
+	visual = visual_iter.data;
+	if(!found) return -1;
+	*vid = visual->visual_id;
+
+	return 0;
+}
+
+static int x11_check_shm_version(xcb_connection_t *xcb) {
+	xcb_shm_query_version_cookie_t cookie;
+	xcb_shm_query_version_reply_t *version;
+	const xcb_query_extension_reply_t *ext;
+	xcb_generic_error_t *err = NULL;
+
+	ext = xcb_get_extension_data(xcb, &xcb_shm_id);
+	if(!ext || ext->present == 0) return -1;
+
+	cookie = xcb_shm_query_version(xcb);
+	version = xcb_shm_query_version_reply(xcb, cookie, &err);
+	if(err) {
+		printf("xcb_shm_query_version error: %d\n", err->error_code);
+		free(err);
+		return -1;
+	}
+
+	if(!version) return -1;
+	if(version->major_version != 1 || version->minor_version < 2) {
+		printf("xcb-shm incompatible version: want 1.2 have %d.%d", version->major_version, version->minor_version);
+		free(version);
+		return -1;
+	}
+	free(version);
+	return 0;
+}
+
 term_display_t *term_x11_display_init(void) {
 	xcb_term_display_t *xcb = calloc(1, sizeof(xcb_term_display_t));
+	xcb_screen_iterator_t iter;
+	xcb_void_cookie_t cookie;
+	xcb_generic_error_t *err = NULL;
+	if(!xcb) return NULL;
 
 	int screen_no = 0;
 
 	xcb->connection = xcb_connect(NULL, &screen_no);
+	if(xcb_connection_has_error(xcb->connection)) {
+		goto err_xcb_disconnect;
+	}
 
 	xcb->setup = xcb_get_setup(xcb->connection);
-	xcb_screen_iterator_t iter = xcb_setup_roots_iterator(xcb->setup);
+	iter = xcb_setup_roots_iterator(xcb->setup);
 	for(int i = 0; i < screen_no; i++) {
 		xcb_screen_next(&iter);
 	}
 	xcb->screen = iter.data;
 
-	xcb_shm_query_version_cookie_t cookie = xcb_shm_query_version(xcb->connection);
-	xcb_shm_query_version_reply_t *version = xcb_shm_query_version_reply(xcb->connection, cookie, NULL);
-	if(version->major_version != 1 && version->minor_version < 2) {
-		printf("Minimum xcb-shm extension version not met. Want 1.2 have %d.%d\n", version->major_version, version->minor_version);
-		return NULL;
+	if(x11_check_shm_version(xcb->connection) == -1) {
+		goto err_xcb_disconnect;
 	}
-	free(version);
 
-	uint32_t events = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE;
+	xcb->bpp = 32;
+	if(x11_match_visual(xcb->screen, 32, XCB_VISUAL_CLASS_TRUE_COLOR, &xcb->visid) == -1) {
+		printf("Failed to find 32bit color depth trying 24bit\n");
+		xcb->bpp = 24;
+		if(xcb->screen->root_depth == 24) {
+			xcb->visid = xcb->screen->root_visual;
+		} else if(x11_match_visual(xcb->screen, 24, XCB_VISUAL_CLASS_TRUE_COLOR, &xcb->visid) == -1) {
+			printf("No 32 or 24bit color depth.\n");
+			goto err_xcb_disconnect;
+		}
+	}
+
+	if(xcb->visid == xcb->screen->root_visual) {
+		xcb->colormap = xcb->screen->default_colormap;
+	} else {
+		xcb->colormap = xcb_generate_id(xcb->connection);
+		xcb_create_colormap(xcb->connection, XCB_COLORMAP_ALLOC_NONE, xcb->colormap, xcb->screen->root, xcb->visid);
+	}
+
+	uint32_t winevents = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+											 XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |
+											 XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
+											 XCB_EVENT_MASK_POINTER_MOTION;
+	uint32_t mask = XCB_CW_BACK_PIXMAP | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP;
+	uint32_t values[] = { XCB_PIXMAP_NONE, 0x000000, winevents, xcb->colormap };
+
 	xcb->window = xcb_generate_id(xcb->connection);
-	xcb_create_window(xcb->connection, xcb->screen->root_depth, xcb->window, xcb->screen->root, 0, 0, 640, 480, 1, XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, XCB_CW_EVENT_MASK, &events);
-
+	cookie = xcb_create_window_checked(xcb->connection, xcb->bpp, xcb->window,
+										xcb->screen->root, 0, 0, 640, 480, 1,
+										XCB_WINDOW_CLASS_INPUT_OUTPUT, xcb->visid,
+										mask, values);
+	err = xcb_request_check(xcb->connection, cookie);
+	if(err) {
+		printf("xcb_create_window: %d\n", err->error_code);
+		free(err);
+		goto err_xcb_disconnect;
+	}
 	xcb_map_window(xcb->connection, xcb->window);
+
 	xcb->gc = xcb_generate_id(xcb->connection);
-	xcb_create_gc(xcb->connection, xcb->gc, xcb->window, 0, NULL);
-	xcb_flush(xcb->connection);
-	xkb_x11_setup_xkb_extension(xcb->connection, XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION, 0, NULL, NULL, &xcb->xkb_event, &xcb->xkb_error);
+	cookie = xcb_create_gc_checked(xcb->connection, xcb->gc, xcb->window, 0, NULL);
+	err = xcb_request_check(xcb->connection, cookie);
+	if(err) {
+		printf("xcb_create_gc error: %d\n", err->error_code);
+		free(err);
+		goto err_xcb_disconnect;
+	}
+
+	int ret = xkb_x11_setup_xkb_extension(xcb->connection, XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION, 0, NULL, NULL, &xcb->xkb_event, &xcb->xkb_error);
+	if(ret == 0) {
+		printf("xkb_x11_setup_xkb_extension error\n");
+		goto err_xcb_disconnect;
+	}
+
+	int32_t device_id = xkb_x11_get_core_keyboard_device_id(xcb->connection);
+	if(device_id == -1) {
+		printf("xkb_x11_get_core_keyboard_device_id error\n");
+		goto err_xcb_disconnect;
+	}
 
 	xcb->ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-	xcb->keymap = xkb_x11_keymap_new_from_device(xcb->ctx, xcb->connection, xkb_x11_get_core_keyboard_device_id(xcb->connection), XKB_KEYMAP_COMPILE_NO_FLAGS);
-	xcb->state = xkb_x11_state_new_from_device(xcb->keymap, xcb->connection, xkb_x11_get_core_keyboard_device_id(xcb->connection));
+	xcb->keymap = xkb_x11_keymap_new_from_device(xcb->ctx, xcb->connection, device_id, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	xcb->state = xkb_x11_state_new_from_device(xcb->keymap, xcb->connection, device_id);
 
-	uint16_t xkb_events = XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY | XCB_XKB_EVENT_TYPE_MAP_NOTIFY | XCB_XKB_EVENT_TYPE_STATE_NOTIFY;
+	uint16_t xkb_events = XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY |
+												XCB_XKB_EVENT_TYPE_MAP_NOTIFY |
+												XCB_XKB_EVENT_TYPE_STATE_NOTIFY;
+
 	xcb_xkb_select_events_aux(xcb->connection, XCB_XKB_ID_USE_CORE_KBD, xkb_events, 0, xkb_events, 0, 0, NULL);
 
 	xcb_intern_atom_cookie_t protocol_cookie = xcb_intern_atom_unchecked(xcb->connection, 1, 12, "WM_PROTOCOLS");
@@ -241,8 +359,14 @@ term_display_t *term_x11_display_init(void) {
 	xcb_change_property(xcb->connection, XCB_PROP_MODE_REPLACE, xcb->window, protocol_reply->atom, 4, 32, 1, &xcb->close->atom);
 	free(protocol_reply);
 
+	xcb_flush(xcb->connection);
 	xcb->base.attach_shm = term_x11_attach_shm;
 	xcb->base.dispatch = term_x11_display_dispatch;
 	xcb->base.deinit = term_x11_display_deinit;
 	return &xcb->base;
+
+err_xcb_disconnect:
+	xcb_disconnect(xcb->connection);
+	free(xcb);
+	return NULL;
 }
