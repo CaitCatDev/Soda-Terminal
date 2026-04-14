@@ -6,7 +6,7 @@ LD=clang
 WL_SCANNER=`pkg-config --variable=wayland_scanner wayland-scanner`
 WL_PROTOCOLS=`pkg-config --variable=pkgdatadir wayland-protocols`
 
-CFLAGS=-O0 -D_XOPEN_SOURCE=600 -DTERM_WL_SUPPORT=1 -DTERM_X11_SUPPORT=1 -I ./include/ -I ./ -g -fsanitize=address `pkg-config --cflags fontconfig freetype2 wayland-client xkbcommon harfbuzz`
+CFLAGS=-O0 -DTERM_WL_SUPPORT=1 -DTERM_X11_SUPPORT=1 -I ./include/ -I ./ -g -fsanitize=address `pkg-config --cflags fontconfig freetype2 wayland-client xkbcommon harfbuzz`
 LDFLAGS=`pkg-config --libs fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11 harfbuzz xcb xcb-shm xcb-xkb`
 
 TARGET=project_terminal

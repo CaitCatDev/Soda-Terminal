@@ -1,6 +1,5 @@
-#include <xcb/xproto.h>
-#ifdef __FREEBSD__
-#define __BSD_VISIBLE 1
+#ifdef __linux__
+	#define _XOPEN_SOURCE 600
 #endif
 
 #include <stdio.h>
@@ -8,6 +7,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <time.h>
 
@@ -17,9 +17,6 @@
 
 #include <poll.h>
 #include <pwd.h>
-#if defined(__linux__)
-#include <pty.h>
-#endif
 
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -325,7 +322,6 @@ int allocate_shm_file(int32_t size) {
 	char template[] = "/xxxx-term-wlshm";
 	int fd = -1;
 	int res = -1;
-	srand(time(NULL));
 
 	do {
 		for(uint32_t i = 1; i < 5; i++) {
@@ -1121,6 +1117,7 @@ static void usage(const char *arg0) {
 }
 
 int main(int argc, char **argv) {
+	srand(time(NULL));
 	int parent = 0;
 	int child = 0;
 	FT_Error error = 0;

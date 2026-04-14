@@ -2,7 +2,7 @@ project('project-terminal', 'c')
 
 cc = meson.get_compiler('c')
 
-add_project_arguments(['-D_XOPEN_SOURCE=600'] + ['-I./include/'] + ['-pedantic'] +
+add_project_arguments(['-I./include/'] + ['-pedantic'] +
                       ['-Wall'] + ['-Wextra'], language : 'c')
 
 if cc.has_argument('-Wstrict-aliasing')
@@ -26,14 +26,14 @@ wayland_scanner_bin = find_program(wayland_scanner.get_variable('wayland_scanner
 wayland_proto_datadir = wayland_protocols.get_variable('pkgdatadir')
 
 xdg_shell_protocol_header = custom_target(
-  'xdg-shell-client-protocol',
+  'xdg-shell-client-protocol-header',
   output: '@BASENAME@-client-protocol.h',
   input: wayland_proto_datadir + '/stable/xdg-shell/xdg-shell.xml',
   command: [wayland_scanner_bin, 'client-header', '@INPUT@', '@OUTPUT@']
   )
 
 xdg_shell_protocol_src = custom_target(
-  'xdg-shell-client-protocol',
+  'xdg-shell-client-protocol-src',
   output: '@BASENAME@-protocol-code.c',
   input: wayland_proto_datadir + '/stable/xdg-shell/xdg-shell.xml',
   command: [wayland_scanner_bin, 'private-code', '@INPUT@', '@OUTPUT@']
