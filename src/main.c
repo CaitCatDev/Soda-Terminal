@@ -47,21 +47,25 @@
 #define FORMAT_ARGB8888 0
 #define FORMAT_XRGB8888 1
 
-#define ROW_MAX 30
-#define COLUMN_MAX 100
+#define INITIAL_ROW_MAX 30
+#define INITIAL_COLUMN_MAX 100
+#define INITIAL_WIN_WIDTH 800
+#define INITIAL_WIN_HEIGHT 600
+
 #define BG_COLOR 0xff000000
 #define FG_COLOR 0xfff8f8f2
 #define CSD_BG_COLOR 0xffd3d3d3
 #define CSD_FG_COLOR 0xff000000
 #define UTF8_ESCAPE 0x1b
 
-#define CURSOR_MOVE_RIGHT "[C"
-#define CURSOR_CLEAR_INLINE "[K"
-#define CURSOR_HOME_STR "[H"
-#define CLEAR_SCREEN_STR "[2J"
+#define CURSOR_MOVE_RIGHT "C"
+#define CURSOR_CLEAR_INLINE "K"
+#define CURSOR_HOME_STR "H"
+#define CLEAR_SCREEN_STR "2J"
 #define CSDS_HEIGHT 20
 
 #define IN_RANGE(x, l, h) (x >= l && x <= h)
+#define MIN(a, b) (a < b ? a : b)
 
 #define WIDGET_LEFT 0
 #define WIDGET_RIGHT 1
@@ -126,9 +130,12 @@ typedef struct term_ctx_s {
 	term_display_t *dpy;
 
 	/*Hardcoded to 30rows 100cols*/
-	term_cell_t screen[ROW_MAX][COLUMN_MAX];
-	uint32_t col;
-	uint32_t row;
+	term_cell_t **screen;
+	int32_t col;
+	int32_t row;
+	int32_t max_cols;
+	int32_t max_rows;
+
 	uint32_t fg;
 	uint32_t bg;
 	utf32_t cursor;
@@ -304,7 +311,6 @@ int forkshell(int parent, int child) {
 		printf("Neither $SHELL or pw->pw_shell have a shell set\n");
 		return -1;
 	}
-
 	pid = fork();
 
 	if(pid < 0) {
@@ -431,13 +437,13 @@ static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, ui
 }
 
 static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t *data) {
-	for(uint32_t i = 0; i < ROW_MAX; i++) {
+	for(int32_t i = 0; i < ctx->max_rows; i++) {
 		hb_buffer_t *buf = hb_buffer_create();
 		if(hb_buffer_allocation_successful(buf) == false) {
 			printf("hb_buffer_create failed: %s\n", strerror(errno));
 			return -1;
 		}
-		for(uint32_t x = 0; x < COLUMN_MAX; x++) {
+		for(int32_t x = 0; x < ctx->max_cols; x++) {
 			if(ctx->screen[i][x].utf32 == 0) break;
 			hb_buffer_add_utf32(buf, &ctx->screen[i][x].utf32, 1, 0, -1);
 		}
@@ -463,8 +469,8 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 }
 
 static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t *data) {
-	for(uint32_t y = 0; y < ROW_MAX; ++y) {
-		for(uint32_t x = 0; x < COLUMN_MAX; ++x) {
+	for(int32_t y = 0; y < ctx->max_rows; ++y) {
+		for(int32_t x = 0; x < ctx->max_cols; ++x) {
 			if(ctx->screen[y][x].utf32) {
 				FT_Set_Pixel_Sizes(ctx->face, 16, 16);
 				render_char(ctx->face, ctx->screen[y][x].utf32, 16, ctx->advance * x, y * 16, data, width, height, ctx->fg);
@@ -558,10 +564,11 @@ static void draw_label(FT_Face face, widget_label_t *label, void *data, int32_t 
 	}
 }
 */
+
 void term_clear_screen(term_ctx_t *ctx) {
-	for(uint32_t y = 0; y < ROW_MAX; y++) {
-		for(uint32_t x = 0; x < COLUMN_MAX; x++) {
-			ctx->screen[y][x].utf32 = 0;
+	for(int32_t y = 0; y < ctx->max_rows; y++) {
+		for(int32_t x = 0; x < ctx->max_cols; x++) {
+			ctx->screen[y][x].utf32 = ' ';
 			ctx->screen[y][x].attributes = 0;
 			ctx->screen[y][x].fg = ctx->fg;
 			ctx->screen[y][x].bg = ctx->bg;
@@ -571,8 +578,7 @@ void term_clear_screen(term_ctx_t *ctx) {
 
 void handle_csi(term_ctx_t *state) {
 	char escape[128] = { 0 };
-	uint32_t i = 1;
-	escape[0] = '[';
+	uint32_t i = 0;
 
 	do {
 		read(state->ptmx, &escape[i], 1);
@@ -606,14 +612,12 @@ void handle_csi(term_ctx_t *state) {
 			state->screen[state->row][state->col].attributes = 0;
 		}
 	} else if(strcmp(CLEAR_SCREEN_STR, escape) == 0) {
-		for(uint32_t y = 0; y < ROW_MAX; y++) {
-			term_clear_screen(state);
-		}
+		term_clear_screen(state);
 	} else if(strcmp(CURSOR_MOVE_RIGHT, escape) == 0) {
 		state->col++;
 	} else if(strcmp(CURSOR_CLEAR_INLINE, escape) == 0) {
-		for(uint32_t i = state->col; i < COLUMN_MAX; i++) {
-			state->screen[state->row][i].utf32 = 0;
+		for(int32_t i = state->col; i < state->max_cols; i++) {
+			state->screen[state->row][i].utf32 = ' ';
 		}
 	} else {
 		printf("Unknown Escape Sequence: %s\n", escape);
@@ -677,32 +681,31 @@ uint32_t tty_read_utf32(int fd) {
 void term_event(term_ctx_t *term) {
 	struct pollfd pfd = { term->ptmx, POLLIN, 0 };
 	uint32_t c = 0;
-	int r = 0;
-	while((r = poll(&pfd, 1, 100))) {
+	while(poll(&pfd, 1, 0)) {
 		if(pfd.revents & POLLHUP || pfd.revents & POLLERR) {
 			printf("error poll: %s\n", strerror(errno));
 			term->running = 0;
 			break;
 		} else if(pfd.revents & POLLIN) {
 			c = tty_read_utf32(term->ptmx);
-			if(term->col >= COLUMN_MAX) {
-				term->col = 0;
+			if(term->col >= term->max_cols) {
 				term->row++;
 			}
-			if(term->row >= ROW_MAX) {
-				for(uint32_t i = 1; i < ROW_MAX; i++) {
-					memcpy(term->screen[i-1], term->screen[i], COLUMN_MAX * sizeof(term_cell_t));
+			if(term->row >= term->max_rows) {
+				for(int32_t i = 1; i < term->max_rows; i++) {
+					memcpy(term->screen[i-1], term->screen[i], term->max_cols * sizeof(term_cell_t));
 				}
-				term->row = ROW_MAX - 1;
-				term->col = 0;
-				memset(term->screen[term->row], 0, COLUMN_MAX * sizeof(term_cell_t));
+				term->max_rows--;
+				for(int32_t i = 0; i < term->max_cols; i++) {
+					term->screen[term->row][i].utf32 = ' ';
+				}
 			}
 			if(c == UTF8_ESCAPE) {
 				process_escape(term);
 				continue;
 			}
 			if(c == '\t') {
-				for(uint32_t i = 0; i < 8 - (term->col % 8); ++i) {
+				for(int32_t i = 0; i < 8 - (term->col % 8); ++i) {
 					term->screen[term->row][term->col + i].utf32 = ' ';
 				}
 				term->col += 8 - (term->col % 8);
@@ -712,6 +715,7 @@ void term_event(term_ctx_t *term) {
 				continue;
 			}
 			if(c == '\b') {
+				
 				if(term->col)
 					term->col--;
 				continue;
@@ -753,6 +757,31 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	term_ctx_t *term = data;
 	term->width = width;
 	term->height = height;
+	int32_t rows = term->height / (term->face->size->metrics.height >> 6);
+	int32_t cols = term->width / (term->face->size->metrics.max_advance >> 6);
+	printf("Rows %d Cols %d\n", rows, cols);
+
+	if(rows != term->max_rows || cols != term->max_cols) {
+		term_cell_t **new = malloc(rows * sizeof(term_cell_t *));
+		for(int32_t r = 0; r < rows; r++) {
+			new[r] = calloc(cols, sizeof(term_cell_t));
+			if(r < term->max_rows) {
+				memcpy(new[r], term->screen[r], MIN(cols, term->max_cols) * sizeof(term_cell_t));
+			}
+		}
+
+		for(int32_t r = 0; r < term->max_rows; r++) {
+			free(term->screen[r]);
+		}
+		free(term->screen);
+
+		term->screen = new;
+		term->max_rows = rows;
+		term->max_cols = cols;
+	}
+
+	struct winsize wsz = { rows, cols, width, height };
+	ioctl(term->ptmx, TIOCSWINSZ, &wsz);
 
 	int fd = draw_frame(term);
 	if(fd == -1) {
@@ -881,6 +910,13 @@ int main(int argc, char **argv) {
 	term->bg = BG_COLOR;
 	term->fg = FG_COLOR;
 	term->cursor = L'█';
+
+	term->max_rows = INITIAL_ROW_MAX;
+	term->max_cols = INITIAL_COLUMN_MAX;
+	term->screen = calloc(term->max_rows, sizeof(term_cell_t *));
+	for(int32_t i = 0; i < term->max_rows; ++i) {
+		term->screen[i] = calloc(term->max_cols, sizeof(term_cell_t));
+	}
 	term_clear_screen(term);
 
 	term->features[0].tag = HB_TAG('c', 'a', 'l', 't');
@@ -963,6 +999,10 @@ int main(int argc, char **argv) {
 		goto err_close_pty;
 	}
 
+	struct winsize wsz = { term->max_rows, term->max_cols, INITIAL_WIN_WIDTH, INITIAL_WIN_HEIGHT };
+	ioctl(term->ptmx, TIOCSWINSZ, &wsz);
+
+
 #if defined(TERM_WL_SUPPORT)
 	if(getenv("WAYLAND_DISPLAY")) {
 		term->dpy = term_wl_display_init();
@@ -992,8 +1032,8 @@ int main(int argc, char **argv) {
 	pfds[0].events = POLLIN;
 	pfds[0].fd = term->ptmx;
 
-	term->width = 800;
-	term->height = 600;
+	term->width = INITIAL_WIN_WIDTH;
+	term->height = INITIAL_WIN_WIDTH;
 
 	while(term->running) {
 		term->dpy->dispatch(term->dpy);
@@ -1005,6 +1045,11 @@ int main(int argc, char **argv) {
 			break;
 		}
 	}
+
+	for(int32_t r = 0; r < term->max_rows; ++r) {
+		free(term->screen[r]);
+	}
+	free(term->screen);
 
 	term->dpy->deinit(term->dpy);
 	hb_font_destroy(term->hb_font);
