@@ -1,3 +1,4 @@
+#include <xcb/xproto.h>
 #ifdef __FREEBSD__
 #define __BSD_VISIBLE 1
 #endif
@@ -27,6 +28,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_ADVANCES_H
+#include FT_OUTLINE_H
 
 #include <hb.h>
 #include <hb-ft.h>
@@ -52,6 +54,8 @@
 #define INITIAL_WIN_WIDTH 800
 #define INITIAL_WIN_HEIGHT 600
 
+#define CSI_MAX_PARAM 8
+
 #define BG_COLOR 0xff000000
 #define FG_COLOR 0xfff8f8f2
 #define CSD_BG_COLOR 0xffd3d3d3
@@ -72,17 +76,6 @@
 #define WIDGET_CENTER 2
 
 typedef uint32_t utf32_t;
-
-static const uint32_t term_pallete[] = {
-	0xff000000,
-	0xffff0000,
-	0xff00ff00,
-	0xffffff00,
-	0xff0000ff,
-	0xffff00ff,
-	0xff00ffff,
-	0xffffffff,
-};
 
 typedef struct {
 	utf32_t utf32;
@@ -138,9 +131,12 @@ typedef struct term_ctx_s {
 
 	uint32_t fg;
 	uint32_t bg;
+	uint32_t attributes;
+
 	utf32_t cursor;
 	uint32_t def_fg;
 	uint32_t def_bg;
+	uint32_t colortable[256];
 	uint32_t width;
 	uint32_t height;
 } term_ctx_t;
@@ -250,7 +246,7 @@ static void child_proc_exec(const struct passwd *pw, char *shell, int fd) {
 	setenv("USER", pw->pw_name, 1);
 	setenv("SHELL", shell, 1);
 	setenv("HOME", pw->pw_dir, 1);
-	setenv("TERM", "xterm", 1);
+	setenv("TERM", "project-term", 1);
 
 	char *args[2] = { shell, NULL };
 
@@ -419,6 +415,9 @@ static void render_char(FT_Face face, uint32_t utf, uint32_t sz, uint32_t x, uin
 
 static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32_t x, uint32_t y, term_cell_t *cell, uint32_t *data, uint32_t w, uint32_t h) {
 	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
+	if(cell->attributes == 1 && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+		FT_Outline_Embolden(&face->glyph->outline, 1 * 64);
+	}
 	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
 	FT_GlyphSlot glyph = face->glyph;
 
@@ -576,6 +575,229 @@ void term_clear_screen(term_ctx_t *ctx) {
 	}
 }
 
+void term_set_attributes(term_ctx_t *term, uint32_t *params, uint32_t pcount) {
+	if(pcount == 0) {
+		term->attributes = 0;
+		term->fg = term->def_fg;
+		term->bg = term->def_bg;
+		return;
+	}
+
+	for(uint32_t p = 0; p < pcount; ++p) {
+		uint32_t param = params[p];
+		if(param == 0) {
+			term->attributes = 0;
+			term->fg = term->def_fg;
+			term->bg = term->def_bg;
+		}
+
+		if(param == 1) {
+			term->attributes = 1;
+		}
+
+		if(param >= 30 && param <= 37) {
+			term->fg = term->colortable[param-30];
+		} else if(param == 38) {
+			switch(params[1]) {
+				case 2:
+					term->fg = MAKE_ARGB(params[2], params[3], params[4]);
+					p+=4;
+					break;
+				case 5:
+					term->fg = term->colortable[params[2] & 0xff];
+					p+=2;
+					break;
+				default:
+					break;
+			}
+		} else if(param == 39) {
+			term->fg = term->def_fg;
+		} else if(param >= 40 && param <= 47) {
+			term->bg = term->colortable[param-40];
+		} else if(param == 48) {
+			switch(params[1]) {
+				case 2:
+					term->bg = MAKE_ARGB(params[2], params[3], params[4]);
+					p+=4;
+					break;
+				case 5:
+					term->bg = term->colortable[params[2 & 0xff]];
+					p+=2;
+					break;
+				default:
+					break;
+			}
+		} else if(param == 49) {
+			term->bg = term->def_bg;
+		}
+	}
+}
+
+void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
+	uint8_t private = 0;
+	uint8_t intermediate = 0;
+	uint8_t mode = 0;
+	uint32_t param_count = 0;
+	uint32_t parameters[CSI_MAX_PARAM] = { 0 };
+	uint32_t i = 0;
+
+	if(csi[i] >= '<' && csi[i] <= '?') {
+		private = csi[i];
+		i++;
+	}
+
+	const char *p = &csi[i];
+	while(p < csi + len) {
+		char *np = NULL;
+		if(param_count == CSI_MAX_PARAM) break;
+		if(!IN_RANGE(p[0], '0', ';')) break;
+		while(p[0] == ':' || p[0] == ';') {
+			param_count++;
+			p++;
+		}
+
+		parameters[param_count] = strtoul(p, &np, 10);
+		p = np;
+		param_count++;
+		if(*p == ';' || *p == ':') p++;
+	}
+
+	if(IN_RANGE(p[0], 0x20, 0x2f)) {
+		intermediate = p[0];
+		p++;
+	}
+	mode = p[0];
+
+	switch(private) {
+		case '<':
+			goto unknown_csi;
+			break;
+		case '=':
+			goto unknown_csi;
+			break;
+		case '>':
+			goto unknown_csi;
+			break;
+		case '?':
+			goto unknown_csi;
+			break;
+		default:
+			switch(mode) {
+				case 'H':
+					if(param_count == 0) {
+						term->row = 0;
+						term->col = 0;
+					} else {
+						term->row = parameters[0] ? parameters[0]-1 : parameters[0];
+						term->col = parameters[1]-1;
+					}
+					break;
+				case 'J':
+					switch (parameters[0]) {
+						case 0:
+							for(int32_t r = term->row; r < term->max_rows; r++) {
+								for(int32_t c = r == 0 ? term->col : 0; c < term->max_cols; c++) {
+									term->screen[r][c].utf32 = ' ';
+									term->screen[r][c].bg = term->bg;
+									term->screen[r][c].fg = term->fg;
+								}
+							}
+							break;
+						case 1:
+							for(int32_t r = term->row; r > 0; r--) {
+								for(int32_t c = r == 0 ? term->col : term->max_cols; c > 0; c--) {
+									term->screen[r-1][c-1].utf32 = ' ';
+									term->screen[r-1][c-1].bg = term->bg;
+									term->screen[r-1][c-1].fg = term->fg;
+								}
+							}
+							break;
+						case 2:
+							term_clear_screen(term);
+							break;
+						case 3:
+							printf("Erase Scrollback TODO\n");
+							break;
+						default:
+							goto unknown_csi;
+					}
+					break;
+				case 'K':
+					switch(parameters[0]) {
+						case 0:
+							for(int32_t c = term->col; c < term->max_cols; c++) {
+								term->screen[term->row][c].utf32 = ' ';
+							}
+							break;
+						case 1:
+							for(int32_t c = 0; c < term->col; c++) {
+								term->screen[term->row][c].utf32 = ' ';
+							}
+							break;
+						case 2:
+							for(int32_t c = 0; c < term->max_cols; c++) {
+								term->screen[term->row][c].utf32 = ' ';
+							}
+							break;
+						default:
+							goto unknown_csi;
+					}
+					break;
+				case 'n':
+					switch(parameters[0]) {
+						case 5: /*Device status report hardcode response 0 aka OK*/
+							write(term->ptmx, "\x1b[0n", strlen("\x1b[0n"));
+							break;
+						default: goto unknown_csi;
+					}
+					break;
+				case 'c':
+					write(term->ptmx, "\x1b[?1;0c", strlen("\x1b[?1;0c"));
+					break;
+				case 'A':
+					if(parameters[0] == 0) parameters[0]++;
+					while(parameters[0]--) {
+						term->row--;
+					};
+					break;
+				case 'B':
+					if(parameters[0] == 0) parameters[0]++;
+					while(parameters[0]--) {
+						term->row++;
+					}
+					break;
+				case 'C':
+					if(parameters[0] == 0) parameters[0]++;
+					while(parameters[0]--) {
+						term->col++;
+					}
+					break;
+				case 'D':
+					if(parameters[0] == 0) parameters[0]++;
+					while(parameters[0]--) {
+						term->col--;
+					}
+					break;
+				case 'm':
+					term_set_attributes(term, parameters, param_count);
+					break;
+				case 'q':
+					break;
+				default:
+					goto unknown_csi;
+			}
+			break;
+	}
+
+	return;
+unknown_csi:
+	printf("Unknown CSI(%s):\n\tPrivate: %c(%x)\n\tIntermediate: %c(%x)\n\tMode: %c\n\tParameters: [", csi, private, private, intermediate, intermediate, mode);
+	for(uint32_t p = 0; p < param_count; ++p) {
+		printf(" %d,", parameters[p]);
+	}
+	printf("]\n");
+}
+
 void handle_csi(term_ctx_t *state) {
 	char escape[128] = { 0 };
 	uint32_t i = 0;
@@ -585,43 +807,7 @@ void handle_csi(term_ctx_t *state) {
 		i++;
 	} while(i < 127 && !IN_RANGE(escape[i-1], 0x40, 0x7f));
 
-
-	if(escape[i-1] == 'n') {
-		if(escape[i-2] == '6') {
-			write(state->ptmx, "\x1b[0;0R", 6);
-		} else if(escape[i-2] == '5') {
-			write(state->ptmx, "\x1b[0n", 4);
-		}
-		return;
-	} else if(escape[i-1] == 'H') {
-		uint32_t r = strtoul(&escape[1], NULL, 10);
-		uint32_t c = strtoul(&escape[strcspn(escape, ";")+1], NULL, 10);
-		state->row = r;
-		state->col = c;
-	} else if(escape[i-1] == 'm') {
-		uint32_t i = strtoul(&escape[1], NULL, 10);
-		if(i >= 30 && i <= 37) {
-			i -= 30;
-			state->fg = term_pallete[i];
-		} else if(i >= 40 && i <= 47) {
-			i -= 40;
-			state->bg = term_pallete[i];
-		} else {
-			state->screen[state->row][state->col].fg = state->def_fg;
-			state->screen[state->row][state->col].bg = state->def_bg;
-			state->screen[state->row][state->col].attributes = 0;
-		}
-	} else if(strcmp(CLEAR_SCREEN_STR, escape) == 0) {
-		term_clear_screen(state);
-	} else if(strcmp(CURSOR_MOVE_RIGHT, escape) == 0) {
-		state->col++;
-	} else if(strcmp(CURSOR_CLEAR_INLINE, escape) == 0) {
-		for(int32_t i = state->col; i < state->max_cols; i++) {
-			state->screen[state->row][i].utf32 = ' ';
-		}
-	} else {
-		printf("Unknown Escape Sequence: %s\n", escape);
-	}
+	exec_csi(state, escape, i);
 }
 
 void handle_strescape(term_ctx_t *state, char byte) {
@@ -690,12 +876,13 @@ void term_event(term_ctx_t *term) {
 			c = tty_read_utf32(term->ptmx);
 			if(term->col >= term->max_cols) {
 				term->row++;
+				term->col = 0;
 			}
 			if(term->row >= term->max_rows) {
 				for(int32_t i = 1; i < term->max_rows; i++) {
 					memcpy(term->screen[i-1], term->screen[i], term->max_cols * sizeof(term_cell_t));
 				}
-				term->max_rows--;
+				term->row = term->max_rows - 1;
 				for(int32_t i = 0; i < term->max_cols; i++) {
 					term->screen[term->row][i].utf32 = ' ';
 				}
@@ -728,10 +915,10 @@ void term_event(term_ctx_t *term) {
 				term->col = 0;
 				continue;
 			}
-
 			term->screen[term->row][term->col].utf32 = c;
 			term->screen[term->row][term->col].fg = term->fg;
 			term->screen[term->row][term->col].bg = term->bg;
+			term->screen[term->row][term->col].attributes = term->attributes;
 			term->col++;
 		}
 	}
@@ -834,6 +1021,42 @@ void term_handle_close(void *data) {
 
 	term->running = 0;
 }
+
+void term_fallback_color_table(term_ctx_t *term) {
+	/*Standard Term Colors [30-37m*/
+	term->colortable[0] = 0xff000000;
+	term->colortable[1] = 0xffc00000;
+	term->colortable[2] = 0xff00c000;
+	term->colortable[3] = 0xffc0c000;
+	term->colortable[4] = 0xff0000c0;
+	term->colortable[5] = 0xffc000c0;
+	term->colortable[6] = 0xff00c0c0;
+	term->colortable[7] = 0xffe1e1e1;
+
+	/*Bright Term Colors [90-97m*/
+	term->colortable[8] = 0xff808080;
+	term->colortable[9] = 0xffff0000;
+	term->colortable[10] = 0xff00ff00;
+	term->colortable[11] = 0xffffff00;
+	term->colortable[12] = 0xff0000ff;
+	term->colortable[13] = 0xffff00ff;
+	term->colortable[14] = 0xff00ffff;
+	term->colortable[15] = 0xffffffff;
+
+	for(uint32_t r = 0; r < 6; r++) {
+		for(uint32_t g = 0; g < 6; g++) {
+			for(uint32_t b = 0; b < 6; b++) {
+				term->colortable[16 + 36 * r + 6 * g + b] = MAKE_ARGB(r * 41, g * 41, b * 41);
+			}
+		}
+	}
+
+	for(uint32_t i = 232; i <= 255; ++i) {
+		uint8_t p = (uint32_t)(10.625 * (i - 232));
+		term->colortable[i] = MAKE_ARGB(p, p, p);
+	}
+}
+
 /*
 static int btn_is_in(widget_button_t *btn, int32_t x, int32_t y, int32_t w, int32_t h) {
 	int32_t bx = 0;
@@ -917,7 +1140,6 @@ int main(int argc, char **argv) {
 	for(int32_t i = 0; i < term->max_rows; ++i) {
 		term->screen[i] = calloc(term->max_cols, sizeof(term_cell_t));
 	}
-	term_clear_screen(term);
 
 	term->features[0].tag = HB_TAG('c', 'a', 'l', 't');
 	term->features[0].value = 1;
@@ -958,6 +1180,8 @@ int main(int argc, char **argv) {
 			term->features[0].value = 0;
 		}
 	}
+	term_fallback_color_table(term);
+	term_clear_screen(term);
 
 	term->def_fg = term->fg;
 	term->def_bg = term->bg;
