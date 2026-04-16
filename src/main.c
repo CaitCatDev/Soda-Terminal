@@ -34,6 +34,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include <term/display.h>
+#include <term/log.h>
 
 #if defined(__FreeBSD__)
 #include <dev/evdev/input-event-codes.h>
@@ -137,7 +138,6 @@ typedef struct term_ctx_s {
 	uint32_t bg;
 	uint32_t attributes;
 
-
 	utf32_t cursor;
 	uint32_t def_fg;
 	uint32_t def_bg;
@@ -211,19 +211,19 @@ int getpty(int *parent, int *child) {
 
 	p = posix_openpt(O_RDWR | O_NOCTTY);
 	if(p < 0) {
-		printf("posix_openpt: %s\n", strerror(errno));
+		log_error("posix_openpt: %s\n", strerror(errno));
 		return -1;
 	}
 
 	if(grantpt(p) < 0) {
 		close(p);
-		printf("grantpt: %s\n", strerror(errno));
+		log_error("grantpt: %s\n", strerror(errno));
 		return -1;
 	}
 
 	if(unlockpt(p) < 0) {
 		close(p);
-		printf("unlockpt: %s\n", strerror(errno));
+		log_error("unlockpt: %s\n", strerror(errno));
 		return -1;
 	}
 
@@ -239,7 +239,7 @@ int getpty(int *parent, int *child) {
 		child_path = ptsname(p);
 		if(child_path == NULL) {
 			close(p);
-			printf("ptsname: %s\n", strerror(errno));
+			log_error("ptsname: %s\n", strerror(errno));
 			return -1;
 		}
 		c = open(child_path, O_RDWR | O_NOCTTY);
@@ -266,27 +266,27 @@ static void child_proc_exec(const struct passwd *pw, char *shell, int fd) {
 	char *args[2] = { shell, NULL };
 
 	if(setsid() < 0) {
-		printf("error setsid: %s\n", strerror(errno));
+		log_error("setsid: %s\n", strerror(errno));
 		close(fd);
 		exit(1);
 	}
 
 	if(ioctl(fd, TIOCSCTTY, NULL) == -1) {
-		printf("error ioctl(TIOCSCTTY): %s\n", strerror(errno));
+		log_error("ioctl(TIOCSCTTY): %s\n", strerror(errno));
 		close(fd);
 		exit(1);
 	}
 
 	struct termios termios = { 0 };
 	if(tcgetattr(fd, &termios) < 0) {
-		printf("error tcgetattr: %s\n", strerror(errno));
+		log_error("tcgetattr: %s\n", strerror(errno));
 		close(fd);
 		exit(1);
 	}
 	termios.c_iflag |= IUTF8;
 
 	if(tcsetattr(fd, TCSANOW, &termios) == -1) {
-		printf("error tcsetattr: %s\n", strerror(errno));
+		log_error("tcsetattr: %s\n", strerror(errno));
 		close(fd);
 		exit(1);
 	}
@@ -297,7 +297,7 @@ static void child_proc_exec(const struct passwd *pw, char *shell, int fd) {
 	close(fd);
 
 	if(execvp(shell, args) < 0) {
-		printf("error execve: %s\n", strerror(errno));
+		log_error("execve: %s\n", strerror(errno));
 		close(fd);
 	}
 	exit(1);
@@ -310,7 +310,7 @@ int forkshell(int parent, int child) {
 
 	pw = getpwuid(getuid());
 	if(pw == NULL) {
-		printf("getpwuid failed: %s\n", strerror(errno));
+		log_error("getpwuid failed: %s\n", strerror(errno));
 		return -1;
 	}
 
@@ -348,7 +348,7 @@ int allocate_shm_file(int32_t size) {
 		fd = shm_open(template, O_RDWR | O_CREAT | O_EXCL, S_IWUSR | S_IRUSR);
 	} while(fd < 0 && errno == EEXIST);
 	if(fd < 0) {
-		printf("error shm_open: %s\n", strerror(errno));
+		log_error("shm_open: %s\n", strerror(errno));
 		return -1;
 	}
 	shm_unlink(template);
@@ -358,7 +358,7 @@ int allocate_shm_file(int32_t size) {
 	 res = posix_fallocate(fd, 0, size);
 	} while(res < 0 && errno == EINTR);
 	if(res < 0) {
-		printf("error posix_fallocate: %s\n", strerror(errno));
+		log_error("posix_fallocate: %s\n", strerror(errno));
 		close(fd);
 		return -1;
 	}
@@ -406,29 +406,27 @@ static uint32_t alpha_blend(uint32_t cnew, uint32_t cdst, float alpha) {
 	return MAKE_ARGB(ro, go, bo);
 }
 
-static void render_glyph(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg) {
+static void render_glyph(FT_Face face, uint32_t glyph_index, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg, uint32_t yadv) {
 	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
 	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
 	FT_GlyphSlot glyph = face->glyph;
 
 	for(uint32_t cy = 0; cy < glyph->bitmap.rows; cy++) {
 		for(uint32_t cx = 0; cx < glyph->bitmap.width; cx++) {
-			if(glyph->bitmap.buffer[cy * glyph->bitmap.pitch + cx]) {
-				float alpha = (float)glyph->bitmap.buffer[cy * glyph->bitmap.pitch + cx] / 255.0f;
-				uint32_t px = get_pixel(data, x + cx + glyph->bitmap_left, y + sz + cy - glyph->bitmap_top, w, h);
-				px = alpha_blend(fg, px, alpha);
-				put_pixel(data, x + cx + glyph->bitmap_left, sz + y + cy - glyph->bitmap_top, w, h, px);
-			}
+			float alpha = (float)glyph->bitmap.buffer[cy * glyph->bitmap.pitch + cx] / 255.0f;
+			uint32_t px = get_pixel(data, x + cx + glyph->bitmap_left, y + yadv + cy - glyph->bitmap_top, w, h);
+			px = alpha_blend(fg, px, alpha);
+			put_pixel(data, x + cx + glyph->bitmap_left, yadv + y + cy - glyph->bitmap_top, w, h, px);
 		}
 	}
 }
 
-static void render_char(FT_Face face, uint32_t utf, uint32_t sz, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg) {
+static void render_char(FT_Face face, uint32_t utf, uint32_t x, uint32_t y, uint32_t *data, uint32_t w, uint32_t h, uint32_t fg, uint32_t yadv) {
 	uint32_t glyph_index = FT_Get_Char_Index(face, utf);
-	render_glyph(face, glyph_index, sz, x, y, data, w, h, fg);
+	render_glyph(face, glyph_index, x, y, data, w, h, fg, yadv);
 }
 
-static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32_t x, uint32_t y,
+static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t x, uint32_t y,
 														 term_cell_t *cell, uint32_t *data, uint32_t w, uint32_t h, uint32_t xadv, uint32_t yadv) {
 	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
 	if(cell->attributes == 1 && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
@@ -439,14 +437,14 @@ static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, ui
 
 	for(uint32_t cy = 0; cy < yadv; cy++) {
 		for(uint32_t cx = 0; cx < xadv; cx++) {
-			put_pixel(data, x + cx, y + cy, w, h, cell->bg);
+			put_pixel(data, x + cx, yadv + y + cy, w, h, cell->bg);
 		}
 	}
 	for(uint32_t cy = 0; cy < glyph->bitmap.rows; cy++) {
 		for(uint32_t cx = 0; cx < glyph->bitmap.width; cx++) {
 			float alpha = (float)glyph->bitmap.buffer[cy * glyph->bitmap.pitch + cx] / 255.0f;
 			uint32_t px = alpha_blend(cell->fg, cell->bg, alpha);
-			put_pixel(data, x + cx + glyph->bitmap_left, sz + y + cy - glyph->bitmap_top, w, h, px);
+			put_pixel(data, x + cx + glyph->bitmap_left, yadv + y + cy - glyph->bitmap_top, w, h, px);
 		}
 	}
 }
@@ -455,7 +453,7 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 	for(int32_t i = 0; i < ctx->max_rows; i++) {
 		hb_buffer_t *buf = hb_buffer_create();
 		if(hb_buffer_allocation_successful(buf) == false) {
-			printf("hb_buffer_create failed: %s\n", strerror(errno));
+			log_error("hb_buffer_create failed: %s\n", strerror(errno));
 			return -1;
 		}
 		for(int32_t x = 0; x < ctx->max_cols; x++) {
@@ -471,7 +469,7 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 		hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, &glyph_count);
 		for(uint32_t j = 0; j < glyph_count; j++) {
 			hb_codepoint_t glyphid = glyph_info[j].codepoint;
-			render_term_cell(ctx->face, glyphid, 16, j * ctx->x_advance, ctx->y_advance * i, &ctx->screen[i][j], data, width, height, ctx->x_advance, ctx->y_advance);
+			render_term_cell(ctx->face, glyphid, j * ctx->x_advance, ctx->y_advance * i, &ctx->screen[i][j], data, width, height, ctx->x_advance, ctx->y_advance);
 		}
 		hb_buffer_destroy(buf);
 	}
@@ -486,7 +484,7 @@ static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, i
 		for(int32_t x = 0; x < ctx->max_cols; ++x) {
 			if(ctx->screen[y][x].utf32) {
 				uint32_t gi = FT_Get_Char_Index(ctx->face, ctx->screen[y][x].utf32);
-				render_term_cell(ctx->face, gi, 16, ctx->x_advance * x, y * ctx->y_advance, &ctx->screen[y][x], data, width, height, ctx->x_advance, ctx->y_advance);
+				render_term_cell(ctx->face, gi, ctx->x_advance * x, y * ctx->y_advance, &ctx->screen[y][x], data, width, height, ctx->x_advance, ctx->y_advance);
 			}
 		}
 	}
@@ -526,7 +524,7 @@ static int draw_frame(term_ctx_t *ctx) {
 	}
 
 	if(ctx->mode & TERM_MODE_SHOW_CURSOR) {
-		render_char(ctx->face, ctx->cursor, 16, ctx->x_advance * ctx->col, ctx->row * ctx->y_advance, data, width, height, ctx->def_fg);
+		render_char(ctx->face, ctx->cursor, ctx->x_advance * ctx->col, ctx->row * ctx->y_advance, data, width, height, ctx->def_fg, ctx->y_advance);
 	}
 
 	munmap(data, size);
@@ -674,7 +672,7 @@ void term_set_attributes(term_ctx_t *term, uint32_t *params, uint32_t pcount) {
 			case 45:
 			case 46:
 			case 47:
-				term->fg = term->colortable[param - 40];
+				term->bg = term->colortable[param - 40];
 				break;
 			case 48:
 				switch(params[p+1]) {
@@ -823,7 +821,7 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 							term_clear_screen(term);
 							break;
 						case 3:
-							printf("Erase Scrollback TODO\n");
+							log_warn("Erase Scrollback TODO\n");
 							break;
 						default:
 							goto unknown_csi;
@@ -903,7 +901,7 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 					term_set_attributes(term, parameters, param_count);
 					break;
 				case 'r':
-					printf("TODO set scroll region\n");
+					log_warn("TODO set scroll region\n");
 					term->row = 0;
 					term->col = 0;
 					break;
@@ -926,7 +924,7 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 
 	return;
 unknown_csi:
-	printf("Unknown CSI(%s):\n\tPrivate: %c(%x)\n\tIntermediate: %c(%x)\n\tMode: %c\n\tParameters: [", csi, private, private, intermediate, intermediate, mode);
+	log_debug("Unknown CSI(%s):\n\tPrivate: %c(%x)\n\tIntermediate: %c(%x)\n\tMode: %c\n\tParameters: [", csi, private, private, intermediate, intermediate, mode);
 	for(uint32_t p = 0; p < param_count; ++p) {
 		printf(" %d,", parameters[p]);
 	}
@@ -956,7 +954,7 @@ void handle_strescape(term_ctx_t *state, char byte) {
 		if(strcmp(&escape[i-1], "\x1b\\") == 0) break;
 		i++;
 	} while(i < 4095);
-	printf("Unknown Escape Sequence: %s\n", escape);
+	log_debug("Unknown Escape Sequence: %s\n", escape);
 }
 
 
@@ -984,7 +982,7 @@ void process_escape(term_ctx_t *state) {
 		state->col = state->saved_col;
 		state->row = state->saved_row;
 	} else {
-		printf("Unknown Escape Format: \\x1b%c\n", escape);
+		log_debug("Unknown Escape Format: \\x1b%c\n", escape);
 	}
 }
 
@@ -1006,7 +1004,7 @@ uint32_t tty_read_utf32(int fd) {
 		return (((uint32_t)(b1 & 0x07) << 18) | ((uint32_t)(extbytes[0] & 0x3f) << 12) | ((uint32_t)(extbytes[1] & 0x3f) << 6) | ((uint32_t)extbytes[2] & 0x3f));
 	}
 
-	perror("UTF8 Decode Error: longer than 4bytes\n");
+	log_error("UTF8 sequence longer than 4 bytes");
 	return 0;
 }
 
@@ -1015,7 +1013,7 @@ void term_event(term_ctx_t *term) {
 	uint32_t c = 0;
 	while(poll(&pfd, 1, 0)) {
 		if(pfd.revents & POLLHUP || pfd.revents & POLLERR) {
-			printf("error poll: %s\n", strerror(errno));
+			log_error("poll: %s\n", strerror(errno));
 			term->running = 0;
 			break;
 		} else if(pfd.revents & POLLIN) {
@@ -1074,7 +1072,7 @@ void term_event(term_ctx_t *term) {
 
 	int fd = draw_frame(term);
 	if(fd == -1) {
-		printf("draw_frame failed: %s\n", strerror(errno));
+		log_error("draw_frame failed: %s\n", strerror(errno));
 		term->running = 0;
 		return;
 	}
@@ -1161,7 +1159,7 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 
 	int fd = draw_frame(term);
 	if(fd == -1) {
-		printf("draw_frame failed: %s\n", strerror(errno));
+		log_error("draw_frame failed: %s\n", strerror(errno));
 		term->running = 0;
 		return;
 	}
@@ -1240,7 +1238,6 @@ int term_handle_key_application(term_ctx_t *ctx, uint32_t key) {
 
 	for(uint32_t i = 0; i < sizeof(app_keypad) / sizeof(app_keypad[0]); i++) {
 		if(keysym == app_keypad[i].keysym) {
-			printf("writing: %s\n", app_keypad[i].str);
 			write(ctx->ptmx, app_keypad[i].str, strlen(app_keypad[i].str));
 			return 1;
 		}
@@ -1409,21 +1406,21 @@ int main(int argc, char **argv) {
 	int child = 0;
 	FT_Error error = 0;
 	const char *font_name = "monospace";
+
+	log_set_level(TERM_LOG_LEVEL_INFO, 0);
+	log_set_file(stderr);
+
 	term_ctx_t *term = calloc(1, sizeof(term_ctx_t));
 	if(!term) {
-		printf("calloc failed: %s\n", strerror(errno));
+		log_error("calloc failed: %s\n", strerror(errno));
 		return -1;
 	}
 	term->bg = BG_COLOR;
 	term->fg = FG_COLOR;
-	term->cursor = L'█';
+	term->cursor = cursors[0];
 
 	term->max_rows = INITIAL_ROW_MAX;
 	term->max_cols = INITIAL_COLUMN_MAX;
-
-	term->primary = term_allocate_screen(term->max_rows, term->max_cols);
-	term->altscreen = term_allocate_screen(term->max_rows, term->max_cols);
-	term->screen = term->primary;
 
 	term->features[0].tag = HB_TAG('c', 'a', 'l', 't');
 	term->features[0].value = 1;
@@ -1433,6 +1430,7 @@ int main(int argc, char **argv) {
 	for(int i = 1; i < argc; ++i) {
 		if(strcmp(argv[i], "--help") == 0) {
 			usage(argv[0]);
+			free(term);
 			return -1;
 		} else if(strcmp(argv[i], "--font-name") == 0) {
 			if(i == argc - 1) {
@@ -1464,6 +1462,9 @@ int main(int argc, char **argv) {
 			term->features[0].value = 0;
 		}
 	}
+	term->primary = term_allocate_screen(term->max_rows, term->max_cols);
+	term->altscreen = term_allocate_screen(term->max_rows, term->max_cols);
+	term->screen = term->primary;
 	term_fallback_color_table(term);
 	term_clear_screen(term);
 
@@ -1473,22 +1474,22 @@ int main(int argc, char **argv) {
 
 	const char *fname = find_font_file(font_name);
 	if(fname == NULL) {
-		printf("error getting found file from fcconfig: %s\n", strerror(errno));
+		log_error("getting font file from fcconfig: %s\n", strerror(errno));
 		goto err_free_term;
 	}
-	printf("Chosen Font: %s\n", fname);
+	log_info("Chosen Font: %s\n", fname);
 
 	error = FT_Init_FreeType(&term->library);
 	if(error) {
 		free((void*)fname);
-		printf("Freetype Library Init failed %s\n", FT_Error_String(error));
+		log_error("Freetype Library Init failed %s\n", FT_Error_String(error));
 		goto err_free_term;
 	}
 
 	error = FT_New_Face(term->library, fname, 0, &term->face);
 	free((void*)fname);
 	if(error) {
-		printf("Freetype Library Init failed %s\n", FT_Error_String(error));
+		log_error("Freetype Library Init failed %s\n", FT_Error_String(error));
 		goto err_free_freetype;
 	}
 	FT_Set_Pixel_Sizes(term->face, 16, 16);
@@ -1504,12 +1505,12 @@ int main(int argc, char **argv) {
 	hb_ft_font_set_load_flags(term->hb_font, FT_LOAD_DEFAULT);
 
 	if(getpty(&parent, &child) == -1) {
-		printf("getpty failed: %s\n", strerror(errno));
+		log_error("getpty failed: %s\n", strerror(errno));
 		goto err_free_face;
 	}
 
 	if(forkshell(parent, child) == -1) {
-		printf("forkshell failed: %s\n", strerror(errno));
+		log_error("forkshell failed: %s\n", strerror(errno));
 		close(child);
 		goto err_close_pty;
 	}
@@ -1530,7 +1531,7 @@ int main(int argc, char **argv) {
 #endif
 
 	if(term->dpy == NULL) {
-		printf("Failed to create display\n");
+		log_error("Failed to create display\n");
 		return -1;
 	}
 

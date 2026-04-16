@@ -10,7 +10,7 @@ CFLAGS=-O0 -std=c99 -DTERM_WL_SUPPORT=1 -DTERM_X11_SUPPORT=1 -I ./include/ -I ./
 LDFLAGS=`pkg-config --libs fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11 harfbuzz xcb xcb-shm xcb-xkb`
 
 TARGET=project_terminal
-COBJS=./src/main.o ./src/wayland.o ./src/x11.o ./xdg-shell-protocol-code.o
+COBJS=./src/main.o ./src/wayland.o ./src/x11.o ./xdg-shell-protocol-code.o ./src/log.o
 
 all: xdg-shell-client-protocol.h xdg-shell-protocol-code.c $(TARGET)
 

@@ -14,6 +14,7 @@
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
 
+#include <term/log.h>
 #include <term/display.h>
 
 #include <wayland-util.h>
@@ -121,7 +122,7 @@ void wl_keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard, uint32_
 	struct xkb_state *state = NULL;
 
 	if(format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
-		printf("Unknown keymap format: %d\n", format);
+		log_error("Unknown keymap format: %d\n", format);
 		close(fd);
 		if(wl->base.callbacks.close) {
 			wl->base.callbacks.close(wl->base.data);
@@ -315,7 +316,7 @@ static const struct wl_pointer_listener wl_pointer_listener = {
 
 void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)data;
-	printf("Seat Caps: %x\n", caps);
+	log_info("Seat Caps: %x\n", caps);
 
 	if(caps & WL_SEAT_CAPABILITY_KEYBOARD) {
 		if(wl->keyboard == NULL) {
@@ -340,7 +341,7 @@ void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
 
 #if defined(WL_SEAT_NAME_SINCE_VERSION)
 void wl_seat_name(void *data, struct wl_seat *seat, const char *name) {
-	printf("Seat Name: %s\n", name);
+	log_info("Seat Name: %s\n", name);
 
 	UNUSED(data);
 	UNUSED(seat);
@@ -561,7 +562,7 @@ void term_wl_display_request_clipboard(term_display_t *dpy) {
 	int pipefd[2];
 
 	if(wl->data_offer == NULL || wl->accepted == 0) {
-		printf("wayland: no wl_data_offer or data offer has incompatible MIME types\n");
+		log_warn("no wl_data_offer or data offer has incompatible MIME types\n");
 		return;
 	}
 
@@ -580,7 +581,7 @@ void term_wl_display_request_clipboard(term_display_t *dpy) {
 	ssize_t ret = 0;
 	char *buffer = calloc(1, 128);
 	if(buffer == NULL) {
-		printf("wl: calloc failed\n");
+		log_error("calloc failed\n");
 		close(pipefd[0]);
 		return;
 	}
@@ -591,7 +592,7 @@ void term_wl_display_request_clipboard(term_display_t *dpy) {
 		if(used >= len - 1) {
 			char *tmp = realloc(buffer, len + 128);
 			if(tmp == NULL) {
-				printf("wayland: realloc failed\n");
+				log_error("realloc failed\n");
 				free(buffer);
 				close(pipefd[0]);
 				return;
@@ -648,57 +649,57 @@ term_display_t *term_wl_display_init(void) {
 
 	wl->display = wl_display_connect(NULL);
 	if(wl->display == NULL) {
-		printf("wl_display_connect failed: %s\n", strerror(errno));
+		log_error("wl_display_connect failed: %s\n", strerror(errno));
 		goto err_free_ctx;
 	}
 	wl->ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
 	wl->registry = wl_display_get_registry(wl->display);
 	if(wl->registry == NULL) {
-		printf("wl_display_get_registry failed: %s\n", strerror(errno));
+		log_error("wl_display_get_registry failed: %s\n", strerror(errno));
 		goto err_disconnect;
 	}
 	wl_registry_add_listener(wl->registry, &wl_registry_listener, wl);
 
 	if(wl_display_roundtrip(wl->display) == -1) {
-		printf("wl_display_roundtrip failed: %s\n", strerror(errno));
+		log_error("wl_display_roundtrip failed: %s\n", strerror(errno));
 		goto err_free_globals;
 	}
 
 	if(wl->compositor == NULL) {
-		printf("no wl_compositor is a compositor running?\n");
+		log_error("no wl_compositor is a compositor running?\n");
 		goto err_free_globals;
 	}
 
 	if(wl->subcompositor == NULL) {
-		printf("No wl_subcompositor\n");
+		log_error("No wl_subcompositor\n");
 		goto err_free_globals;
 	}
 
 	if(wl->seat == NULL) {
-		printf("No wl_seat\n");
+		log_error("No wl_seat\n");
 		goto err_free_globals;
 	}
 
 	if(wl->wm_base == NULL) {
-		printf("No xdg_wm_base\n");
+		log_error("No xdg_wm_base\n");
 		goto err_free_globals;
 	}	
 
 	if(wl->shm == NULL) {
-		printf("No wl_shm\n");
+		log_error("No wl_shm\n");
 		goto err_free_globals;
 	}
 
 	wl->surface = wl_compositor_create_surface(wl->compositor);
 	if(wl->surface == NULL) {
-		printf("wl_compositor_create_surface failed: %s\n", strerror(errno));
+		log_error("wl_compositor_create_surface failed: %s\n", strerror(errno));
 		goto err_free_globals;
 	}
 
 	wl->xdg_surface = xdg_wm_base_get_xdg_surface(wl->wm_base, wl->surface);
 	if(wl->xdg_surface == NULL) {
-		printf("xdg_wm_base_get_xdg_surface failed: %s\n", strerror(errno));
+		log_error("xdg_wm_base_get_xdg_surface failed: %s\n", strerror(errno));
 		goto err_free_surface;
 	}
 	xdg_surface_add_listener(wl->xdg_surface, &xdg_surface_listener, wl);
@@ -707,7 +708,7 @@ term_display_t *term_wl_display_init(void) {
 	xdg_toplevel_set_app_id(wl->xdg_toplevel, "terminal");
 	xdg_toplevel_set_title(wl->xdg_toplevel, "project-terminal");
 	if(wl->xdg_surface == NULL) {
-		printf("xdg_surface_get_toplevel failed: %s\n", strerror(errno));
+		log_error("xdg_surface_get_toplevel failed: %s\n", strerror(errno));
 		goto err_free_surface;
 	}
 	xdg_toplevel_add_listener(wl->xdg_toplevel, &xdg_toplevel_listener, wl);
