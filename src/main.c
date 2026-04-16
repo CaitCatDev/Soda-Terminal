@@ -107,6 +107,7 @@ typedef struct term_ctx_s {
 	int ptmx;
 	int running;
 
+	FcConfig *fcconfig;
 	FT_Library library;
 	FT_Face face;
 	uint32_t x_advance;
@@ -458,11 +459,9 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 		hb_shape(ctx->hb_font, buf, ctx->features, 1);
 		unsigned int glyph_count = 0;
 		hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, &glyph_count);
-		hb_glyph_position_t *glyph_pos = hb_buffer_get_glyph_positions(buf, &glyph_count);
 		for(uint32_t j = 0; j < glyph_count; j++) {
 			hb_codepoint_t glyphid = glyph_info[j].codepoint;
-			hb_position_t x_advance = glyph_pos[j].x_advance >> 6;
-			render_term_cell(ctx->face, glyphid, 16, j * x_advance, ctx->y_advance * i, &ctx->screen[i][j], data, width, height, ctx->x_advance, ctx->y_advance);
+			render_term_cell(ctx->face, glyphid, 16, j * ctx->x_advance, ctx->y_advance * i, &ctx->screen[i][j], data, width, height, ctx->x_advance, ctx->y_advance);
 		}
 		hb_buffer_destroy(buf);
 	}
@@ -926,12 +925,13 @@ uint32_t tty_read_utf32(int fd) {
 		return (uint32_t)b1;
 	} else if((b1 & 0xe0) == 0xc0) {
 		read(fd, extbytes, 1);
-		return (((uint32_t)b1 << 6) | (uint32_t)(extbytes[0] & 0x3f));
+		return (((uint32_t)(b1 & 0x1f) << 6) | (uint32_t)(extbytes[0] & 0x3f));
 	} else if((b1 & 0xf0) == 0xe0) {
 		read(fd, extbytes, 2);
-		return (((uint32_t)b1 << 12) | ((uint32_t)(extbytes[0] & 0x3f) << 6) | (uint32_t)(extbytes[1] & 0x3f));
+		return (((uint32_t)(b1 & 0x0f) << 12) | ((uint32_t)(extbytes[0] & 0x3f) << 6) | (uint32_t)(extbytes[1] & 0x3f));
 	} else if((b1 & 0xf8) == 0xf0) {
 		read(fd, extbytes, 3);
+		return (((uint32_t)(b1 & 0x07) << 18) | ((uint32_t)(extbytes[0] & 0x3f) << 12) | ((uint32_t)(extbytes[1] & 0x3f) << 6) | ((uint32_t)extbytes[2] & 0x3f));
 	}
 
 	perror("UTF8 Decode Error: longer than 4bytes\n");

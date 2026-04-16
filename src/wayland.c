@@ -57,9 +57,6 @@ typedef struct wl_ctx_s {
 static const char *accepted_mimetypes[] = {
 	NULL,
 	"UTF8_STRING",
-	"text/plain;charset=utf-8",
-	"STRING",
-	"text/plain",
 };
 
 void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
@@ -469,9 +466,7 @@ void term_wl_display_dispatch(term_display_t *dpy) {
 
 void wl_data_offer_offer(void *data, struct wl_data_offer *offer, const char *mime) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)data;
-	wl->accepted = 0;
 
-	printf("wayland: data offer mimetype %s\n", mime);
 	for(uint32_t i = 1; i < sizeof(accepted_mimetypes) / sizeof(accepted_mimetypes[0]); ++i) {
 		if(strcmp(mime, accepted_mimetypes[i]) == 0) {
 			wl->accepted = i;
@@ -504,6 +499,7 @@ void wl_data_device_offer(void *data, struct wl_data_device *data_device, struct
 	wl_data_offer_add_listener(offer, &wl_data_offer_listener, data);
 
 	if(wl->data_offer) {
+		wl->accepted = 0;
 		wl_data_offer_destroy(wl->data_offer);
 	}
 
@@ -542,6 +538,7 @@ void wl_data_device_drop(void *data, struct wl_data_device *data_device) {
 void wl_data_device_selection(void *data, struct wl_data_device *data_device, struct wl_data_offer *offer) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)data;
 	if(offer == NULL && wl->data_offer) {
+		wl->accepted = 0;
 		wl_data_offer_destroy(wl->data_offer);
 		wl->data_offer = NULL;
 	}
