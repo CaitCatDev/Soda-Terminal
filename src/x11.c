@@ -3,6 +3,8 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
 
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
@@ -19,6 +21,13 @@
 #include <term/display.h>
 
 #define UNUSED(x) (void)x
+
+#define X11_ATOM_SELECTION_NAME "CLIPBOARD"
+#define X11_ATOM_TARGET_NAME "UTF8_STRING"
+#define X11_ATOM_INCR_NAME "INCR"
+#define X11_ATOM_PROPERTY_NAME "PROJECTTERM"
+#define X11_ATOM_WM_PROTOCOLS_NAME "WM_PROTOCOLS"
+#define X11_ATOM_WM_DELETE_WINDOW "WM_DELETE_WINDOW"
 
 typedef struct xid_free_list xid_free_list_t;
 
@@ -44,7 +53,13 @@ typedef struct x11_term_display {
 	uint8_t xkb_event;
 	uint8_t xkb_error;
 
-	xcb_intern_atom_reply_t *close;
+
+	xcb_atom_t wm_protocols;
+	xcb_atom_t delete_window;
+	xcb_atom_t selection;
+	xcb_atom_t target;
+	xcb_atom_t property;
+	xcb_atom_t incr;
 
 	xcb_visualid_t visid;
 	xcb_colormap_t colormap;
@@ -53,6 +68,26 @@ typedef struct x11_term_display {
 	xcb_window_t window;
 	xcb_gcontext_t gc;
 } xcb_term_display_t;
+
+static const char *x11_error_code_to_str(uint8_t code) {
+	switch(code) {
+		case XCB_REQUEST: return "BadRequest";
+		case XCB_VALUE: return "BadValue";
+		case XCB_WINDOW: return "BadWindow";
+		case XCB_PIXMAP: return "BadPixmap";
+		case XCB_ATOM: return "BadAtom";
+		case XCB_CURSOR: return "BadCursor";
+		case XCB_FONT: return "BadFont";
+		case XCB_MATCH: return "BadMatch";
+		case XCB_COLORMAP: return "BadColormap";
+		case XCB_G_CONTEXT: return "BadGC";
+		case XCB_ID_CHOICE: return "BadID";
+		case XCB_NAME: return "BadName";
+		case XCB_LENGTH: return "BadLength";
+		case XCB_IMPLEMENTATION: return "BadImplementation";
+		default: return "Unknown";
+	}
+}
 
 static void xid_free_list_insert(xid_free_list_t **head, xid_free_list_t *new) {
 	new->next = *head;
@@ -127,37 +162,135 @@ static void x11_handle_xkb_event(xcb_term_display_t *xcb, xcb_generic_event_t *e
 	}
 }
 
+static void x11_handle_keypress(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_key_press_event_t *key = (xcb_key_release_event_t*)ev;
+	xcb->base.callbacks.keypress(xcb->base.data, key->detail, 1);
+	
+	if(key->detail == 24) {
+		xcb_convert_selection(xcb->connection, xcb->window, xcb->selection, xcb->target, xcb->property, XCB_CURRENT_TIME);
+	}
+}
+
+static void x11_handle_keyrelease(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_key_release_event_t *key = (xcb_key_release_event_t*)ev;
+	xcb->base.callbacks.keypress(xcb->base.data, key->detail, 0);
+}
+
+static void x11_handle_configure_notify(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_configure_notify_event_t *configure = (xcb_configure_notify_event_t*)ev;
+	xcb->base.callbacks.configure(xcb->base.data, configure->width, configure->height);
+}
+
+static void x11_handle_client_message(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_client_message_event_t *msg = (xcb_client_message_event_t*)ev;
+	if(msg->data.data32[0] == xcb->delete_window && xcb->base.callbacks.close) {
+		xcb->base.callbacks.close(xcb->base.data);
+	}
+}
+
+static void x11_handle_error(xcb_term_display_t *xcb, xcb_generic_error_t *err) {
+	xcb_value_error_t *verr = (xcb_value_error_t*)err;
+	printf("x11: %s(%u) Error:\n\tOpcode: %u.%u\n\tBad Value/ID: %u\n", 
+				 x11_error_code_to_str(verr->error_code), verr->error_code,
+				 verr->major_opcode, verr->minor_opcode, verr->bad_value);
+	UNUSED(xcb);
+}
+
+static void x11_handle_selection_notify(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_selection_notify_event_t *selection = (xcb_selection_notify_event_t*)ev;
+	xcb_generic_error_t *err = NULL;
+
+	if(selection->property == XCB_NONE) {
+		printf("x11: ignoring non UTF8 paste\n");
+		return;
+	}
+
+	xcb_get_property_cookie_t cookie = xcb_get_property(xcb->connection, false, xcb->window, xcb->property, xcb->target, 0, 0);
+	xcb_get_property_reply_t *reply = xcb_get_property_reply(xcb->connection, cookie, &err);
+	if(err) {
+		printf("x11: xcb_get_property_reply error: %d\n", err->error_code);
+		free(err);
+		return;
+	}
+
+	if(reply->type == xcb->incr) {
+		printf("x11: data to large and INCR not implemented\n");
+		return;
+	}
+	if(!reply) {
+		printf("x11: allocation failed\n");
+		return;
+	}
+
+	uint32_t total_sz = reply->bytes_after;
+	free(reply);
+	if(total_sz == 0) {
+		return;
+	}
+
+	char *str = calloc(1, total_sz + 1);
+	if(str == NULL) {
+		printf("x11: allocation failed\n");
+		return;
+	}
+
+	cookie = xcb_get_property(xcb->connection, false, xcb->window, xcb->property, xcb->target, 0, total_sz / 4 + 1);
+	reply = xcb_get_property_reply(xcb->connection, cookie, &err);
+	if(err) {
+		printf("x11: xcb_get_property_reply error: %d\n", err->error_code);
+		free(str);
+		free(err);
+		return;
+	}
+
+	if(!reply) {
+		printf("x11: allocation failed\n");
+		free(str);
+		return;
+	}
+
+
+	memcpy(str, xcb_get_property_value(reply), xcb_get_property_value_length(reply));
+	free(reply);
+	if(xcb->base.callbacks.clipboard_str_callback) {
+		xcb->base.callbacks.clipboard_str_callback(xcb->base.data, str);
+	}
+
+	xcb_delete_property(xcb->connection, xcb->window, xcb->property);
+	xcb_flush(xcb->connection);
+	free(str);
+}
+
 static void x11_handle_core_event(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
 	switch(ev->response_type & ~0x80) {
-		case XCB_KEY_PRESS: {
-			xcb_key_press_event_t *key = (xcb_key_release_event_t*)ev;
-			xcb->base.callbacks.keypress(xcb->base.data, key->detail, 1);
+		case XCB_KEY_PRESS:
+			x11_handle_keypress(xcb, ev);
 			break;
-		}	
-		case XCB_KEY_RELEASE: {
-			xcb_key_release_event_t *key = (xcb_key_release_event_t*)ev;
-			xcb->base.callbacks.keypress(xcb->base.data, key->detail, 0);
+		case XCB_KEY_RELEASE:
+			x11_handle_keyrelease(xcb, ev);
 			break;
-		}
-		case XCB_CONFIGURE_NOTIFY: {
-			xcb_configure_notify_event_t *configure = (xcb_configure_notify_event_t*)ev;
-			xcb->base.callbacks.configure(xcb->base.data, configure->width, configure->height);
+		case XCB_CONFIGURE_NOTIFY:
+			x11_handle_configure_notify(xcb, ev);
 			break;
-		}
-		case XCB_CLIENT_MESSAGE: {
-			if(((xcb_client_message_event_t*)ev)->data.data32[0] == xcb->close->atom && xcb->base.callbacks.close) {
-				xcb->base.callbacks.close(xcb->base.data);
-			}
+		case XCB_CLIENT_MESSAGE:
+			x11_handle_client_message(xcb, ev);
 			break;
-		}
-		case 0: {
-			xcb_generic_error_t *err = (xcb_generic_error_t*)ev;
-			printf("X11 Error: %d %d.%d\n", err->error_code, err->major_code, err->minor_code);
+		case XCB_SELECTION_NOTIFY:
+			x11_handle_selection_notify(xcb, ev);
 			break;
-		}
+		case 0:
+			x11_handle_error(xcb, (xcb_generic_error_t*)ev);
+			break;
 		default:
 			break;
 	}
+}
+
+static void term_x11_request_clipboard_text(term_display_t *dpy) {
+	xcb_term_display_t *xcb = (xcb_term_display_t*)dpy;
+
+	xcb_convert_selection(xcb->connection, xcb->window, xcb->selection, xcb->target, xcb->property, XCB_CURRENT_TIME);
+	xcb_flush(xcb->connection);
 }
 
 static void term_x11_display_dispatch(term_display_t *dpy) {
@@ -186,7 +319,6 @@ void term_x11_display_deinit(term_display_t *dpy) {
 	xkb_state_unref(xcb->state);
 	xkb_keymap_unref(xcb->keymap);
 	xkb_context_unref(xcb->ctx);
-	free(xcb->close);
 
 	xcb_disconnect(xcb->connection);
 
@@ -257,6 +389,30 @@ static int x11_check_shm_version(xcb_connection_t *xcb) {
 	return 0;
 }
 
+static int x11_get_atom(xcb_connection_t *c, uint8_t if_exists, const char *name, xcb_atom_t *a) {
+	xcb_intern_atom_cookie_t cookie;
+	xcb_intern_atom_reply_t *reply = NULL;
+	xcb_generic_error_t *error = NULL;
+	if(!a) return -1;
+
+	cookie = xcb_intern_atom(c, if_exists, strlen(name), name);
+	reply = xcb_intern_atom_reply(c, cookie, &error);
+	if(error) {
+		printf("xcb_intern_atom_reply error: %d\n", error->error_code);
+		free(error);
+		return -1;
+	}
+
+	if(!reply) {
+		printf("xcb_intern_atom_reply allocation error\n");
+		return -1;
+	}
+
+	*a = reply->atom;
+	free(reply);
+	return 0;
+}
+
 term_display_t *term_x11_display_init(void) {
 	xcb_term_display_t *xcb = calloc(1, sizeof(xcb_term_display_t));
 	xcb_screen_iterator_t iter;
@@ -315,7 +471,7 @@ term_display_t *term_x11_display_init(void) {
 										mask, values);
 	err = xcb_request_check(xcb->connection, cookie);
 	if(err) {
-		printf("xcb_create_window: %d\n", err->error_code);
+		printf("x11: xcb_create_window error %s(%d)\n", x11_error_code_to_str(err->error_code), err->error_code);
 		free(err);
 		goto err_xcb_disconnect;
 	}
@@ -325,7 +481,7 @@ term_display_t *term_x11_display_init(void) {
 	cookie = xcb_create_gc_checked(xcb->connection, xcb->gc, xcb->window, 0, NULL);
 	err = xcb_request_check(xcb->connection, cookie);
 	if(err) {
-		printf("xcb_create_gc error: %d\n", err->error_code);
+		printf("xcb_create_gc error: %s(%d)\n", x11_error_code_to_str(err->error_code), err->error_code);
 		free(err);
 		goto err_xcb_disconnect;
 	}
@@ -351,18 +507,43 @@ term_display_t *term_x11_display_init(void) {
 												XCB_XKB_EVENT_TYPE_STATE_NOTIFY;
 
 	xcb_xkb_select_events_aux(xcb->connection, XCB_XKB_ID_USE_CORE_KBD, xkb_events, 0, xkb_events, 0, 0, NULL);
+	if(x11_get_atom(xcb->connection, true, X11_ATOM_WM_PROTOCOLS_NAME, &xcb->wm_protocols) == -1) {
+		printf("x11: get_atom %s error\n", X11_ATOM_WM_PROTOCOLS_NAME);
+		goto err_xcb_disconnect;
+	}
 
-	xcb_intern_atom_cookie_t protocol_cookie = xcb_intern_atom_unchecked(xcb->connection, 1, 12, "WM_PROTOCOLS");
-	xcb_intern_atom_reply_t *protocol_reply = xcb_intern_atom_reply(xcb->connection, protocol_cookie, NULL);
-	xcb_intern_atom_cookie_t close_cookie = xcb_intern_atom_unchecked(xcb->connection, 1, 16, "WM_DELETE_WINDOW");
-	xcb->close = xcb_intern_atom_reply(xcb->connection, close_cookie, NULL);
-	xcb_change_property(xcb->connection, XCB_PROP_MODE_REPLACE, xcb->window, protocol_reply->atom, 4, 32, 1, &xcb->close->atom);
-	free(protocol_reply);
+	if(x11_get_atom(xcb->connection, true, X11_ATOM_WM_DELETE_WINDOW, &xcb->delete_window) == -1) {
+		printf("x11: get_atom %s error\n", X11_ATOM_WM_DELETE_WINDOW);
+		goto err_xcb_disconnect;
+	}
+
+	xcb_change_property(xcb->connection, XCB_PROP_MODE_REPLACE, xcb->window, xcb->wm_protocols, 4, 32, 1, &xcb->delete_window);
+
+	if(x11_get_atom(xcb->connection, false, X11_ATOM_SELECTION_NAME, &xcb->selection) == -1) {
+		printf("x11: get_atom %s error\n", X11_ATOM_SELECTION_NAME);
+		goto err_xcb_disconnect;
+	}
+
+	if(x11_get_atom(xcb->connection, false, X11_ATOM_TARGET_NAME, &xcb->target) == -1) {
+		printf("x11: get_atom %s error\n", X11_ATOM_TARGET_NAME);
+		goto err_xcb_disconnect;
+	}
+
+	if(x11_get_atom(xcb->connection, false, X11_ATOM_PROPERTY_NAME, &xcb->property) == -1) {
+		printf("x11: get_atom %s error\n", X11_ATOM_PROPERTY_NAME);
+		goto err_xcb_disconnect;
+	}
+
+	if(x11_get_atom(xcb->connection, 0, X11_ATOM_INCR_NAME, &xcb->incr) == -1) {
+		printf("x11: get_atom %s error\n", X11_ATOM_INCR_NAME);
+		goto err_xcb_disconnect;
+	}
 
 	xcb_flush(xcb->connection);
 	xcb->base.attach_shm = term_x11_attach_shm;
 	xcb->base.dispatch = term_x11_display_dispatch;
 	xcb->base.deinit = term_x11_display_deinit;
+	xcb->base.request_cliboard_text = term_x11_request_clipboard_text;
 	return &xcb->base;
 
 err_xcb_disconnect:

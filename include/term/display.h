@@ -11,6 +11,7 @@ typedef struct {
 	void (*keypress)(void *data, uint32_t key, uint32_t state);
 	void (*repeat_info)(void *data, int32_t rate, int32_t delay);
 	void (*configure)(void *data, uint32_t width, uint32_t height);
+	void (*clipboard_str_callback)(void *data, const char *str);
 	void (*close)(void *data);
 } term_display_callbacks_t;
 
@@ -18,6 +19,7 @@ struct term_display {
 	int (*attach_shm)(term_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format);
 	void (*dispatch)(term_display_t *display);
 	void (*deinit)(term_display_t *display);
+	void (*request_cliboard_text)(term_display_t *display);
 	term_display_callbacks_t callbacks;
 	void *data;
 };

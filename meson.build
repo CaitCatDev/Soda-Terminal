@@ -19,25 +19,26 @@ fontconfig = dependency('fontconfig')
 xkbcommon = dependency('xkbcommon')
 xkbcommon_x11 = dependency('xkbcommon-x11', required: get_option('enable-x11'))
 
-wayland_protocols = dependency('wayland-protocols')
-wayland_scanner = dependency('wayland-scanner')
-wayland_scanner_bin = find_program(wayland_scanner.get_variable('wayland_scanner'))
+wayland_protocols = dependency('wayland-protocols', required: get_option('enable-wl'))
+wayland_scanner = dependency('wayland-scanner', required: get_option('enable-wl'))
 
-wayland_proto_datadir = wayland_protocols.get_variable('pkgdatadir')
+if wayland_protocols.found()
+  wayland_proto_datadir = wayland_protocols.get_variable('pkgdatadir')
+  wayland_scanner_bin = find_program(wayland_scanner.get_variable('wayland_scanner'))
+  xdg_shell_protocol_header = custom_target(
+    'xdg-shell-client-protocol-header',
+    output: '@BASENAME@-client-protocol.h',
+    input: wayland_proto_datadir + '/stable/xdg-shell/xdg-shell.xml',
+    command: [wayland_scanner_bin, 'client-header', '@INPUT@', '@OUTPUT@']
+    )
 
-xdg_shell_protocol_header = custom_target(
-  'xdg-shell-client-protocol-header',
-  output: '@BASENAME@-client-protocol.h',
-  input: wayland_proto_datadir + '/stable/xdg-shell/xdg-shell.xml',
-  command: [wayland_scanner_bin, 'client-header', '@INPUT@', '@OUTPUT@']
-  )
-
-xdg_shell_protocol_src = custom_target(
-  'xdg-shell-client-protocol-src',
-  output: '@BASENAME@-protocol-code.c',
-  input: wayland_proto_datadir + '/stable/xdg-shell/xdg-shell.xml',
-  command: [wayland_scanner_bin, 'private-code', '@INPUT@', '@OUTPUT@']
-  )
+  xdg_shell_protocol_src = custom_target(
+    'xdg-shell-client-protocol-src',
+    output: '@BASENAME@-protocol-code.c',
+    input: wayland_proto_datadir + '/stable/xdg-shell/xdg-shell.xml',
+    command: [wayland_scanner_bin, 'private-code', '@INPUT@', '@OUTPUT@']
+    )
+endif
 
 srcs = [ './src/main.c' ]
 inc = include_directories('./include/')

@@ -1,9 +1,12 @@
+#include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <sys/poll.h>
 #include <unistd.h>
 
 #include <poll.h>
@@ -13,6 +16,7 @@
 
 #include <term/display.h>
 
+#include <wayland-util.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include <xdg-shell-client-protocol.h>
@@ -28,6 +32,12 @@ typedef struct wl_ctx_s {
 	struct wl_seat *seat;
 	struct wl_compositor *compositor;
 	struct wl_subcompositor *subcompositor;
+	struct wl_data_device_manager *ddm;
+
+	struct wl_data_source *data_source;
+	struct wl_data_device *data_dev;
+	struct wl_data_offer *data_offer;
+	uint32_t accepted;
 
 	struct wl_surface *surface;
 	struct xdg_surface *xdg_surface;
@@ -39,11 +49,18 @@ typedef struct wl_ctx_s {
 	struct xkb_state *state;
 
 	struct wl_pointer *pointer;
-
 	struct xdg_wm_base *wm_base;
 	uint32_t width;
 	uint32_t height;
 } wayland_ctx_t;
+
+static const char *accepted_mimetypes[] = {
+	NULL,
+	"UTF8_STRING",
+	"text/plain;charset=utf-8",
+	"STRING",
+	"text/plain",
+};
 
 void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)data;
@@ -376,6 +393,8 @@ void wl_registry_global(void *data, struct wl_registry *registry, uint32_t name,
 	} else if(strcmp(interface, xdg_wm_base_interface.name) == 0) {
 		wl->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, version);
 		xdg_wm_base_add_listener(wl->wm_base, &xdg_wm_base_listener, wl);
+	} else if(strcmp(interface, wl_data_device_manager_interface.name) == 0) {
+		wl->ddm = wl_registry_bind(registry, name, &wl_data_device_manager_interface, version);
 	}
 }
 
@@ -448,6 +467,151 @@ void term_wl_display_dispatch(term_display_t *dpy) {
 	}
 }
 
+void wl_data_offer_offer(void *data, struct wl_data_offer *offer, const char *mime) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+	wl->accepted = 0;
+
+	printf("wayland: data offer mimetype %s\n", mime);
+	for(uint32_t i = 1; i < sizeof(accepted_mimetypes) / sizeof(accepted_mimetypes[0]); ++i) {
+		if(strcmp(mime, accepted_mimetypes[i]) == 0) {
+			wl->accepted = i;
+			break;
+		}
+	}
+	wl->data_offer = offer;
+}
+
+void wl_data_offer_src_actions(void *data, struct wl_data_offer *offer, uint32_t actions) {
+	UNUSED(data);
+	UNUSED(offer);
+	UNUSED(actions);
+}
+
+void wl_data_offer_action(void *data, struct wl_data_offer *offer, uint32_t action) {
+	UNUSED(data);
+	UNUSED(offer);
+	UNUSED(action);
+}
+
+static const struct wl_data_offer_listener wl_data_offer_listener = {
+	.offer = wl_data_offer_offer,
+	.source_actions = wl_data_offer_src_actions,
+	.action = wl_data_offer_action,
+};
+
+void wl_data_device_offer(void *data, struct wl_data_device *data_device, struct wl_data_offer *offer) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+	wl_data_offer_add_listener(offer, &wl_data_offer_listener, data);
+
+	if(wl->data_offer) {
+		wl_data_offer_destroy(wl->data_offer);
+	}
+
+	wl->data_offer = offer;
+	UNUSED(data_device);
+}
+
+void wl_data_device_enter(void *data, struct wl_data_device *data_device, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *offer) {
+	UNUSED(surface);
+	UNUSED(offer);
+	UNUSED(data);
+	UNUSED(data_device);
+	UNUSED(serial);
+	UNUSED(x);
+	UNUSED(y);
+}
+
+void wl_data_device_leave(void *data, struct wl_data_device *data_device) {
+	UNUSED(data);
+	UNUSED(data_device);
+}
+
+void wl_data_device_motion(void *data, struct wl_data_device *data_device, uint32_t serial, wl_fixed_t x, wl_fixed_t y) {
+	UNUSED(data);
+	UNUSED(data_device);
+	UNUSED(serial);
+	UNUSED(x);
+	UNUSED(y);
+}
+
+void wl_data_device_drop(void *data, struct wl_data_device *data_device) {
+	UNUSED(data);
+	UNUSED(data_device);
+}
+
+void wl_data_device_selection(void *data, struct wl_data_device *data_device, struct wl_data_offer *offer) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+	if(offer == NULL && wl->data_offer) {
+		wl_data_offer_destroy(wl->data_offer);
+		wl->data_offer = NULL;
+	}
+
+	UNUSED(data_device);
+}
+
+
+static const struct wl_data_device_listener wl_data_device_listener = {
+	.data_offer = wl_data_device_offer,
+	.enter = wl_data_device_enter,
+	.leave = wl_data_device_leave,
+	.motion = wl_data_device_motion,
+	.drop = wl_data_device_drop,
+	.selection = wl_data_device_selection,
+};
+
+void term_wl_display_request_clipboard(term_display_t *dpy) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
+	int pipefd[2];
+
+	if(wl->data_offer == NULL || wl->accepted == 0) {
+		printf("wayland: no wl_data_offer or data offer has incompatible MIME types\n");
+		return;
+	}
+
+	int rc = pipe(pipefd);
+	if(rc < 0) {
+		wl_data_offer_destroy(wl->data_offer);
+		wl->data_offer = NULL;
+		return;
+	}
+	wl_data_offer_receive(wl->data_offer, accepted_mimetypes[wl->accepted], pipefd[1]);
+	wl_display_flush(wl->display);
+
+	close(pipefd[1]);
+	size_t len = 128;
+	size_t used = 0;
+	ssize_t ret = 0;
+	char *buffer = calloc(1, 128);
+	if(buffer == NULL) {
+		printf("wl: calloc failed\n");
+		close(pipefd[0]);
+		return;
+	}
+	struct pollfd pfds = { pipefd[0], POLLIN, 0 };
+
+	while(poll(&pfds, 1, 20)) {
+		if(pfds.revents == POLLHUP) break;
+		if(used >= len - 1) {
+			char *tmp = realloc(buffer, len + 128);
+			if(tmp == NULL) {
+				printf("wayland: realloc failed\n");
+				free(buffer);
+				close(pipefd[0]);
+				return;
+			}
+			len += 128;
+			memset(&tmp[used], 0, len - used);
+			buffer = tmp;
+		}
+		ret = read(pipefd[0], &buffer[used], (len - 1) - used);
+		used += ret;
+	}
+
+	close(pipefd[0]);
+	dpy->callbacks.clipboard_str_callback(dpy->data, buffer);
+	free(buffer);
+}
+
 void term_wl_display_deinit(term_display_t *dpy) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
 
@@ -458,15 +622,19 @@ void term_wl_display_deinit(term_display_t *dpy) {
 	xdg_surface_destroy(wl->xdg_surface);
 	wl_surface_destroy(wl->surface);
 
+	wl_data_source_destroy(wl->data_source);
+	wl_data_device_destroy(wl->data_dev);
+
 	if(wl->keyboard) wl_keyboard_destroy(wl->keyboard);
 	if(wl->pointer) wl_pointer_destroy(wl->pointer);
-
+	if(wl->data_offer) wl_data_offer_destroy(wl->data_offer);
 
 	xdg_wm_base_destroy(wl->wm_base);
 	wl_shm_destroy(wl->shm);
 	wl_compositor_destroy(wl->compositor);
 	wl_subcompositor_destroy(wl->subcompositor);
 	wl_seat_destroy(wl->seat);
+	wl_data_device_manager_destroy(wl->ddm);
 
 	xkb_state_unref(wl->state);
 	xkb_keymap_unref(wl->keymap);
@@ -547,12 +715,17 @@ term_display_t *term_wl_display_init(void) {
 	}
 	xdg_toplevel_add_listener(wl->xdg_toplevel, &xdg_toplevel_listener, wl);
 
+	wl->data_dev = wl_data_device_manager_get_data_device(wl->ddm, wl->seat);
+	wl_data_device_add_listener(wl->data_dev, &wl_data_device_listener, wl);
+	wl->data_source = wl_data_device_manager_create_data_source(wl->ddm);
+
 	wl_surface_commit(wl->surface);
 	wl_display_roundtrip(wl->display);
 
 	wl->base.dispatch = term_wl_display_dispatch;
 	wl->base.attach_shm = term_wl_display_attach_shm;
 	wl->base.deinit = term_wl_display_deinit;
+	wl->base.request_cliboard_text = term_wl_display_request_clipboard;
 
 	return &wl->base;
 

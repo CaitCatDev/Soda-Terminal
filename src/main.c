@@ -136,7 +136,13 @@ typedef struct term_ctx_s {
 	uint32_t colortable[256];
 	uint32_t width;
 	uint32_t height;
+	uint32_t mode;
 } term_ctx_t;
+
+#define TERM_BRACKTED_PASTE_MODE (1 << 0)
+
+#define TERM_BRACKTED_PASTE_START_STR "\x1b[200~"
+#define TERM_BRACKTED_PASTE_END_STR "\x1b[201~"
 
 const char *find_font_file(const char *name) {
 	FcConfig *config = NULL;
@@ -335,6 +341,7 @@ int allocate_shm_file(int32_t size) {
 	}
 	shm_unlink(template);
 
+	
 	do {
 	 res = posix_fallocate(fd, 0, size);
 	} while(res < 0 && errno == EINTR);
@@ -581,50 +588,105 @@ void term_set_attributes(term_ctx_t *term, uint32_t *params, uint32_t pcount) {
 
 	for(uint32_t p = 0; p < pcount; ++p) {
 		uint32_t param = params[p];
-		if(param == 0) {
-			term->attributes = 0;
-			term->fg = term->def_fg;
-			term->bg = term->def_bg;
-		}
-
-		if(param == 1) {
-			term->attributes = 1;
-		}
-
-		if(param >= 30 && param <= 37) {
-			term->fg = term->colortable[param-30];
-		} else if(param == 38) {
-			switch(params[1]) {
-				case 2:
-					term->fg = MAKE_ARGB(params[2], params[3], params[4]);
-					p+=4;
-					break;
-				case 5:
-					term->fg = term->colortable[params[2] & 0xff];
-					p+=2;
-					break;
-				default:
-					break;
-			}
-		} else if(param == 39) {
-			term->fg = term->def_fg;
-		} else if(param >= 40 && param <= 47) {
-			term->bg = term->colortable[param-40];
-		} else if(param == 48) {
-			switch(params[1]) {
-				case 2:
-					term->bg = MAKE_ARGB(params[2], params[3], params[4]);
-					p+=4;
-					break;
-				case 5:
-					term->bg = term->colortable[params[2 & 0xff]];
-					p+=2;
-					break;
-				default:
-					break;
-			}
-		} else if(param == 49) {
-			term->bg = term->def_bg;
+		switch(param) {
+			case 0:
+				term->attributes = 0;
+				term->fg = term->def_fg;
+				term->bg = term->def_bg;
+				break;
+			case 1:
+				term->attributes |= 1;
+				break;
+			case 2:
+				break;
+			case 3:
+				break;
+			case 4:
+				break;
+			case 5:
+				break;
+			case 7:
+				break;
+			case 8:
+				break;
+			case 9:
+				break;
+			case 22:
+				term->attributes &= ~(1);
+				break;
+			case 23:
+				break;
+			case 24:
+				break;
+			case 25:
+				break;
+			case 27:
+				break;
+			case 28:
+				break;
+			case 29:
+				break;
+			case 30:
+			case 31:
+			case 32:
+			case 33:
+			case 34:
+			case 35:
+			case 36:
+			case 37:
+				term->fg = term->colortable[param - 30];
+				break;
+			case 38:
+				switch(params[1]) {
+					case 2:
+						term->fg = MAKE_ARGB(params[2], params[3], params[4]);
+						p+=4;
+						break;
+					case 5:
+						term->fg = term->colortable[params[2] & 0xff];
+						p+=2;
+						break;
+					default:
+						break;
+				}
+			break;
+			case 39:
+				term->fg = term->def_fg;
+				break;
+			case 40:
+			case 41:
+			case 42:
+			case 43:
+			case 44:
+			case 45:
+			case 46:
+			case 47:
+				term->fg = term->colortable[param - 40];
+				break;
+			case 48:
+				switch(params[1]) {
+					case 2:
+						term->bg = MAKE_ARGB(params[2], params[3], params[4]);
+						p+=4;
+						break;
+					case 5:
+						term->bg = term->colortable[params[2 & 0xff]];
+						p+=2;
+						break;
+					default:
+						break;
+				}
+				break;
+			case 49:
+				term->bg = term->def_bg;
+				break;
+			default:
+				if(IN_RANGE(param, 90, 97)) {
+					term->fg = term->colortable[param-90+8];
+				} else if(IN_RANGE(param, 100, 107)) {
+					term->fg = term->colortable[param-100+8];
+				}
+				break;
 		}
 	}
 }
@@ -675,7 +737,21 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 			goto unknown_csi;
 			break;
 		case '?':
-			goto unknown_csi;
+			switch(mode) {
+				case 'h':
+					if(parameters[0] == 2004) {
+						term->mode |= (TERM_BRACKTED_PASTE_MODE);
+					}
+					break;
+				case 'l':
+					if(parameters[0] == 2004) {
+						term->mode &= (TERM_BRACKTED_PASTE_MODE);
+					}
+					break;
+				default:
+					goto unknown_csi;
+					break;
+			}
 			break;
 		default:
 			switch(mode) {
@@ -817,7 +893,7 @@ void handle_strescape(term_ctx_t *state, char byte) {
 		if(strcmp(&escape[i-1], "\x1b\\") == 0) break;
 		i++;
 	} while(i < 4095);
-	printf("Unknown Escape Sequence: %s\n", escape);
+	//printf("Unknown Escape Sequence: %s\n", escape);
 }
 
 
@@ -833,10 +909,10 @@ void process_escape(term_ctx_t *state) {
 		return;
 	} else if(escape == '(') {
 		read(state->ptmx, &escape, 1);
-		printf("Unknown Escape Sequence: \\x1b(%c\n", escape);
+		//printf("Unknown Escape Sequence: \\x1b(%c\n", escape);
 		return;
 	}
-	printf("Unknown Escape Format: \\x1b%c\n", escape);
+	//printf("Unknown Escape Format: \\x1b%c\n", escape);
 }
 
 uint32_t tty_read_utf32(int fd) {
@@ -942,7 +1018,6 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	term->height = height;
 	int32_t rows = term->height / (term->face->size->metrics.height >> 6);
 	int32_t cols = term->width / (term->face->size->metrics.max_advance >> 6);
-	printf("Rows %d Cols %d\n", rows, cols);
 
 	if(rows != term->max_rows || cols != term->max_cols) {
 		term_cell_t **new = malloc(rows * sizeof(term_cell_t *));
@@ -976,6 +1051,20 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	close(fd);
 }
 
+void term_handle_cliboard_str(void *data, const char *str) {
+	term_ctx_t *term = (term_ctx_t*)data;
+
+	if(term->mode & TERM_BRACKTED_PASTE_MODE) {
+		write(term->ptmx, TERM_BRACKTED_PASTE_START_STR, strlen(TERM_BRACKTED_PASTE_START_STR));
+	}
+
+	write(term->ptmx, str, strlen(str));
+
+	if(term->mode & TERM_BRACKTED_PASTE_MODE) {
+		write(term->ptmx, TERM_BRACKTED_PASTE_END_STR, strlen(TERM_BRACKTED_PASTE_END_STR));
+	}
+}
+
 void term_handle_key(void *data, uint32_t key, uint32_t state) {
 	term_ctx_t *term = data;
 	xkb_keysym_t keysym = 0;
@@ -983,6 +1072,16 @@ void term_handle_key(void *data, uint32_t key, uint32_t state) {
 
 	if(state == 0) {
 		return;
+	}
+	
+	xkb_mod_mask_t shift = xkb_keymap_mod_get_index(term->keymap, XKB_MOD_NAME_SHIFT);
+	xkb_mod_mask_t ctrl = xkb_keymap_mod_get_index(term->keymap, XKB_MOD_NAME_CTRL);
+
+	if(xkb_state_mod_indices_are_active(term->state, XKB_STATE_MODS_DEPRESSED, XKB_STATE_MATCH_ALL, shift, ctrl, XKB_MOD_INVALID)) {
+		if(xkb_state_key_get_one_sym(term->state, key) == XKB_KEY_V) {
+			term->dpy->request_cliboard_text(term->dpy);
+			return;
+		}
 	}
 
 	keysym = xkb_state_key_get_one_sym(term->state, key);
@@ -1204,8 +1303,13 @@ int main(int argc, char **argv) {
 		goto err_free_freetype;
 	}
 	FT_Set_Pixel_Sizes(term->face, 16, 16);
-	term->advance = term->face->size->metrics.max_advance >> 6;
 
+	/*NotoSansMono Max Advanced is not the same as rest of font
+	 *So use M glyph's advance this has the added benefit of making
+	 *non monospaced also render better
+	 */
+	FT_Load_Char(term->face, 'M', FT_LOAD_DEFAULT);
+	term->advance = term->face->glyph->metrics.horiAdvance >> 6;
 	term->hb_font = hb_ft_font_create_referenced(term->face);
 	hb_ft_font_set_load_flags(term->hb_font, FT_LOAD_DEFAULT);
 
@@ -1247,6 +1351,7 @@ int main(int argc, char **argv) {
 	term->dpy->callbacks.keypress = term_handle_key;
 	term->dpy->callbacks.close = term_handle_close;
 	term->dpy->callbacks.configure = term_handle_configure;
+	term->dpy->callbacks.clipboard_str_callback = term_handle_cliboard_str;
 
 	struct pollfd pfds[1] = { 0 };
 
