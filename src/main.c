@@ -142,6 +142,7 @@ typedef struct term_ctx_s {
 } term_ctx_t;
 
 #define TERM_BRACKTED_PASTE_MODE (1 << 0)
+#define TERM_APP_KEYPAD (1 << 1)
 
 #define TERM_BRACKTED_PASTE_START_STR "\x1b[200~"
 #define TERM_BRACKTED_PASTE_END_STR "\x1b[201~"
@@ -638,13 +639,13 @@ void term_set_attributes(term_ctx_t *term, uint32_t *params, uint32_t pcount) {
 				term->fg = term->colortable[param - 30];
 				break;
 			case 38:
-				switch(params[1]) {
+				switch(params[p+1]) {
 					case 2:
-						term->fg = MAKE_ARGB(params[2], params[3], params[4]);
+						term->fg = MAKE_ARGB(params[p + 2], params[p + 3], params[p + 4]);
 						p+=4;
 						break;
 					case 5:
-						term->fg = term->colortable[params[2] & 0xff];
+						term->fg = term->colortable[params[p + 2] & 0xff];
 						p+=2;
 						break;
 					default:
@@ -665,13 +666,13 @@ void term_set_attributes(term_ctx_t *term, uint32_t *params, uint32_t pcount) {
 				term->fg = term->colortable[param - 40];
 				break;
 			case 48:
-				switch(params[1]) {
+				switch(params[p+1]) {
 					case 2:
-						term->bg = MAKE_ARGB(params[2], params[3], params[4]);
+						term->bg = MAKE_ARGB(params[p + 2], params[p + 3], params[p + 4]);
 						p+=4;
 						break;
 					case 5:
-						term->bg = term->colortable[params[2 & 0xff]];
+						term->bg = term->colortable[params[p + 2] & 0xff];
 						p+=2;
 						break;
 					default:
@@ -851,10 +852,30 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 						term->col--;
 					}
 					break;
+				case 'G':
+					if(parameters[0] == 0) parameters[0]++;
+					term->col = parameters[0] - 1;
+					break;
+				case 'X':
+					if(parameters[0] == 0) parameters[0]++;
+					for(uint32_t k = term->col; k < term->col + parameters[0]; ++k) {
+						term->screen[term->row][k].utf32 = ' ';
+					}
+					break;
+				case 'd':
+					if(parameters[0] == 0) parameters[0]++;
+					term->row = parameters[0] - 1;
+					break;
 				case 'm':
 					term_set_attributes(term, parameters, param_count);
 					break;
+				case 'r':
+					printf("TODO set scroll region\n");
+					term->row = 0;
+					term->col = 0;
+					break;
 				case 'q':
+					printf("TODO set cursor\n");
 					break;
 				default:
 					goto unknown_csi;
@@ -894,7 +915,7 @@ void handle_strescape(term_ctx_t *state, char byte) {
 		if(strcmp(&escape[i-1], "\x1b\\") == 0) break;
 		i++;
 	} while(i < 4095);
-	//printf("Unknown Escape Sequence: %s\n", escape);
+	printf("Unknown Escape Sequence: %s\n", escape);
 }
 
 
@@ -910,10 +931,14 @@ void process_escape(term_ctx_t *state) {
 		return;
 	} else if(escape == '(') {
 		read(state->ptmx, &escape, 1);
-		//printf("Unknown Escape Sequence: \\x1b(%c\n", escape);
 		return;
+	} else if(escape == '=') {
+		state->mode |= TERM_APP_KEYPAD;
+	} else if(escape == '>') {
+		state->mode &= ~(TERM_APP_KEYPAD);
+	} else {
+		printf("Unknown Escape Format: \\x1b%c\n", escape);
 	}
-	//printf("Unknown Escape Format: \\x1b%c\n", escape);
 }
 
 uint32_t tty_read_utf32(int fd) {
@@ -1073,6 +1098,69 @@ void term_handle_cliboard_str(void *data, const char *str) {
 	}
 }
 
+typedef struct term_app_keypad_strs {
+	xkb_keysym_t keysym;
+	const char *str;
+} term_app_keypad_strs_t;
+
+/*Based on VT102/220 keypad*/
+static const term_app_keypad_strs_t app_keypad[] = {
+	{ XKB_KEY_space, "\x1bO " },
+	{ XKB_KEY_Tab, "\x1bOI" },
+	{ XKB_KEY_Return, "\x1bOM" },
+	{ XKB_KEY_asterisk, "\x1bOj" },
+	{ XKB_KEY_plus, "\x1bOk" },
+	{ XKB_KEY_comma, "\x1bOl" },
+	{ XKB_KEY_minus, "\x1bOm" },
+	{ XKB_KEY_period, "\x1bOn" },
+	{ XKB_KEY_division, "\x1bOo" },
+	{ XKB_KEY_0, "\x1bOp" },
+	{ XKB_KEY_1, "\x1bOq" },
+	{ XKB_KEY_2, "\x1bOr" },
+	{ XKB_KEY_3, "\x1bOs" },
+	{ XKB_KEY_4, "\x1bOt" },
+	{ XKB_KEY_5, "\x1bOu" },
+	{ XKB_KEY_6, "\x1bOv" },
+	{ XKB_KEY_7, "\x1bOw" },
+	{ XKB_KEY_8, "\x1bOx" },
+	{ XKB_KEY_9, "\x1bOy" },
+	{ XKB_KEY_equal, "\x1bOX" },
+	{ XKB_KEY_Up, "\x1bOA" },
+	{ XKB_KEY_Down, "\x1bOB" },
+	{ XKB_KEY_Left, "\x1bOD" },
+	{ XKB_KEY_Right, "\x1bOC" },
+	{ XKB_KEY_Insert, "\x1b[2~" },
+	{ XKB_KEY_Delete, "\x1b[3~" },
+	{ XKB_KEY_Home, "\x1b[1~" },
+	{ XKB_KEY_End, "\x1b[4~" },
+	{ XKB_KEY_Page_Up, "\x1b[5~" },
+	{ XKB_KEY_Page_Down, "\x1b[6~" },
+	{ XKB_KEY_F1, "\x1b[11~" },
+	{ XKB_KEY_F2, "\x1b[12~" },
+	{ XKB_KEY_F3, "\x1b[13~" },
+	{ XKB_KEY_F4, "\x1b[14~" },
+	{ XKB_KEY_F5, "\x1b[15~" },
+	{ XKB_KEY_F6, "\x1b[17~" },
+	{ XKB_KEY_F7, "\x1b[18~" },
+	{ XKB_KEY_F8, "\x1b[19~" },
+	{ XKB_KEY_F9, "\x1b[20~" },
+	{ XKB_KEY_F10, "\x1b[21~" },
+	{ XKB_KEY_F11, "\x1b[23~" },
+	{ XKB_KEY_F12, "\x1b[24~" },
+};
+
+int term_handle_key_application(term_ctx_t *ctx, uint32_t key) {
+	xkb_keysym_t keysym = xkb_state_key_get_one_sym(ctx->state, key);
+
+	for(uint32_t i = 0; i < sizeof(app_keypad) / sizeof(app_keypad[0]); i++) {
+		if(keysym == app_keypad[i].keysym) {
+			write(ctx->ptmx, app_keypad[i].str, strlen(app_keypad[i].str));
+			return 1;
+		}
+	}
+	return 0;
+}
+
 void term_handle_key(void *data, uint32_t key, uint32_t state) {
 	term_ctx_t *term = data;
 	xkb_keysym_t keysym = 0;
@@ -1081,7 +1169,12 @@ void term_handle_key(void *data, uint32_t key, uint32_t state) {
 	if(state == 0) {
 		return;
 	}
-	
+
+	if(term->mode & TERM_APP_KEYPAD) {
+		if(term_handle_key_application(term, key))
+			return;
+	}
+
 	xkb_mod_mask_t shift = xkb_keymap_mod_get_index(term->keymap, XKB_MOD_NAME_SHIFT);
 	xkb_mod_mask_t ctrl = xkb_keymap_mod_get_index(term->keymap, XKB_MOD_NAME_CTRL);
 
