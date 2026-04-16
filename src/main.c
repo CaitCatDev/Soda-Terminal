@@ -109,7 +109,8 @@ typedef struct term_ctx_s {
 
 	FT_Library library;
 	FT_Face face;
-	uint32_t advance;
+	uint32_t x_advance;
+	uint32_t y_advance;
 	hb_font_t *hb_font;
 	hb_feature_t features[1];
 	bool disable_harfbuzz;
@@ -416,7 +417,8 @@ static void render_char(FT_Face face, uint32_t utf, uint32_t sz, uint32_t x, uin
 	render_glyph(face, glyph_index, sz, x, y, data, w, h, fg);
 }
 
-static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32_t x, uint32_t y, term_cell_t *cell, uint32_t *data, uint32_t w, uint32_t h) {
+static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, uint32_t x, uint32_t y,
+														 term_cell_t *cell, uint32_t *data, uint32_t w, uint32_t h, uint32_t xadv, uint32_t yadv) {
 	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
 	if(cell->attributes == 1 && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
 		FT_Outline_Embolden(&face->glyph->outline, 1 * 64);
@@ -424,8 +426,8 @@ static void render_term_cell(FT_Face face, uint32_t glyph_index, uint32_t sz, ui
 	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
 	FT_GlyphSlot glyph = face->glyph;
 
-	for(uint32_t cy = 0; cy < face->size->metrics.height >> 6; cy++) {
-		for(uint32_t cx = 0; cx < face->size->metrics.max_advance >> 6; cx++) {
+	for(uint32_t cy = 0; cy < yadv; cy++) {
+		for(uint32_t cx = 0; cx < xadv; cx++) {
 			put_pixel(data, x + cx, y + cy, w, h, cell->bg);
 		}
 	}
@@ -460,7 +462,7 @@ static int render_term_text_hb(term_ctx_t *ctx, int32_t width, int32_t height, i
 		for(uint32_t j = 0; j < glyph_count; j++) {
 			hb_codepoint_t glyphid = glyph_info[j].codepoint;
 			hb_position_t x_advance = glyph_pos[j].x_advance >> 6;
-			render_term_cell(ctx->face, glyphid, 16, j * x_advance, 20 * i, &ctx->screen[i][j], data, width, height);
+			render_term_cell(ctx->face, glyphid, 16, j * x_advance, ctx->y_advance * i, &ctx->screen[i][j], data, width, height, ctx->x_advance, ctx->y_advance);
 		}
 		hb_buffer_destroy(buf);
 	}
@@ -474,8 +476,8 @@ static int render_term_text_ft(term_ctx_t *ctx, int32_t width, int32_t height, i
 	for(int32_t y = 0; y < ctx->max_rows; ++y) {
 		for(int32_t x = 0; x < ctx->max_cols; ++x) {
 			if(ctx->screen[y][x].utf32) {
-				FT_Set_Pixel_Sizes(ctx->face, 16, 16);
-				render_char(ctx->face, ctx->screen[y][x].utf32, 16, ctx->advance * x, y * 16, data, width, height, ctx->fg);
+				uint32_t gi = FT_Get_Char_Index(ctx->face, ctx->screen[y][x].utf32);
+				render_term_cell(ctx->face, gi, 16, ctx->x_advance * x, y * ctx->y_advance, &ctx->screen[y][x], data, width, height, ctx->x_advance, ctx->y_advance);
 			}
 		}
 	}
@@ -514,7 +516,7 @@ static int draw_frame(term_ctx_t *ctx) {
 		render_term_text_hb(ctx, width, height, stride, size, data);
 	}
 
-	render_char(ctx->face, ctx->cursor, 16, ctx->advance * ctx->col, ctx->row * 20, data, width, height, ctx->fg);
+	render_char(ctx->face, ctx->cursor, 16, ctx->x_advance * ctx->col, ctx->row * ctx->y_advance, data, width, height, ctx->fg);
 
 	munmap(data, size);
 	return fd;
@@ -1016,13 +1018,19 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	term_ctx_t *term = data;
 	term->width = width;
 	term->height = height;
-	int32_t rows = term->height / (term->face->size->metrics.height >> 6);
-	int32_t cols = term->width / (term->face->size->metrics.max_advance >> 6);
+	int32_t rows = term->height / term->y_advance;
+	int32_t cols = term->width / term->x_advance;
 
 	if(rows != term->max_rows || cols != term->max_cols) {
 		term_cell_t **new = malloc(rows * sizeof(term_cell_t *));
 		for(int32_t r = 0; r < rows; r++) {
 			new[r] = calloc(cols, sizeof(term_cell_t));
+			for(int32_t c = 0; c < cols; c++) {
+				new[r][c].fg = term->def_fg;
+				new[r][c].bg = term->def_bg;
+				new[r][c].attributes = 0;
+				new[r][c].utf32 = ' ';
+			}
 			if(r < term->max_rows) {
 				memcpy(new[r], term->screen[r], MIN(cols, term->max_cols) * sizeof(term_cell_t));
 			}
@@ -1309,7 +1317,8 @@ int main(int argc, char **argv) {
 	 *non monospaced also render better
 	 */
 	FT_Load_Char(term->face, 'M', FT_LOAD_DEFAULT);
-	term->advance = term->face->glyph->metrics.horiAdvance >> 6;
+	term->x_advance = term->face->glyph->metrics.horiAdvance >> 6;
+	term->y_advance = term->face->size->metrics.height >> 6;
 	term->hb_font = hb_ft_font_create_referenced(term->face);
 	hb_ft_font_set_load_flags(term->hb_font, FT_LOAD_DEFAULT);
 
