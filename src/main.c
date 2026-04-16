@@ -51,7 +51,7 @@
 #define INITIAL_WIN_WIDTH 800
 #define INITIAL_WIN_HEIGHT 600
 
-#define CSI_MAX_PARAM 8
+#define CSI_MAX_PARAM 16
 
 #define BG_COLOR 0xff000000
 #define FG_COLOR 0xfff8f8f2
@@ -73,6 +73,8 @@
 #define WIDGET_CENTER 2
 
 typedef uint32_t utf32_t;
+
+static uint32_t cursors[] = { L'█', L'_', L'|' };
 
 typedef struct {
 	utf32_t utf32;
@@ -121,16 +123,20 @@ typedef struct term_ctx_s {
 
 	term_display_t *dpy;
 
-	/*Hardcoded to 30rows 100cols*/
+	term_cell_t **primary;
+	term_cell_t **altscreen;
 	term_cell_t **screen;
 	int32_t col;
 	int32_t row;
+	int32_t saved_col;
+	int32_t saved_row;
 	int32_t max_cols;
 	int32_t max_rows;
 
 	uint32_t fg;
 	uint32_t bg;
 	uint32_t attributes;
+
 
 	utf32_t cursor;
 	uint32_t def_fg;
@@ -141,8 +147,11 @@ typedef struct term_ctx_s {
 	uint32_t mode;
 } term_ctx_t;
 
-#define TERM_BRACKTED_PASTE_MODE (1 << 0)
-#define TERM_APP_KEYPAD (1 << 1)
+#define TERM_MODE_BRACKTED_PASTE (1 << 0)
+#define TERM_MODE_APP_KEYPAD (1 << 1)
+#define TERM_MODE_APP_CURSOR_KEYS (1 << 2)
+#define TERM_MODE_SHOW_CURSOR (1 << 3)
+#define TERM_MODE_ALT_SCREEN (1 << 4)
 
 #define TERM_BRACKTED_PASTE_START_STR "\x1b[200~"
 #define TERM_BRACKTED_PASTE_END_STR "\x1b[201~"
@@ -516,7 +525,9 @@ static int draw_frame(term_ctx_t *ctx) {
 		render_term_text_hb(ctx, width, height, stride, size, data);
 	}
 
-	render_char(ctx->face, ctx->cursor, 16, ctx->x_advance * ctx->col, ctx->row * ctx->y_advance, data, width, height, ctx->fg);
+	if(ctx->mode & TERM_MODE_SHOW_CURSOR) {
+		render_char(ctx->face, ctx->cursor, 16, ctx->x_advance * ctx->col, ctx->row * ctx->y_advance, data, width, height, ctx->def_fg);
+	}
 
 	munmap(data, size);
 	return fd;
@@ -741,13 +752,35 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 		case '?':
 			switch(mode) {
 				case 'h':
-					if(parameters[0] == 2004) {
-						term->mode |= (TERM_BRACKTED_PASTE_MODE);
+					if(parameters[0] == 1) {
+						term->mode |= (TERM_MODE_APP_CURSOR_KEYS);
+					} else if(parameters[0] == 1049) {
+						term->mode |= (TERM_MODE_ALT_SCREEN);
+						term->screen = term->altscreen;
+						term->saved_row = term->row;
+						term->saved_col = term->col;
+					} else if(parameters[0] == 2004) {
+						term->mode |= (TERM_MODE_BRACKTED_PASTE);
+					} else if(parameters[0] == 25) {
+						term->mode |= (TERM_MODE_SHOW_CURSOR);
+					} else {
+						goto unknown_csi;
 					}
 					break;
 				case 'l':
-					if(parameters[0] == 2004) {
-						term->mode &= (TERM_BRACKTED_PASTE_MODE);
+					if(parameters[0] == 1) {
+						term->mode &= ~(TERM_MODE_APP_CURSOR_KEYS);
+					} else if(parameters[0] == 1049) {
+						term->mode &= ~(TERM_MODE_ALT_SCREEN);
+						term->col = term->saved_col;
+						term->row = term->saved_row;
+						term->screen = term->primary;
+					} else if(parameters[0] == 2004) {
+						term->mode &= ~(TERM_MODE_BRACKTED_PASTE);
+					} else if(parameters[0] == 25) {
+						term->mode &= ~(TERM_MODE_SHOW_CURSOR);
+					} else {
+						goto unknown_csi;
 					}
 					break;
 				default:
@@ -875,8 +908,16 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 					term->col = 0;
 					break;
 				case 'q':
-					printf("TODO set cursor\n");
-					break;
+					switch(intermediate) {
+						case ' ':
+							if(parameters[1] < 3) {
+								term->cursor = cursors[0];
+							} else if(parameters[1] < 5) {
+								term->cursor = cursors[1];
+							} else {
+								term->cursor = cursors[2];
+							}
+					}
 				default:
 					goto unknown_csi;
 			}
@@ -933,9 +974,15 @@ void process_escape(term_ctx_t *state) {
 		read(state->ptmx, &escape, 1);
 		return;
 	} else if(escape == '=') {
-		state->mode |= TERM_APP_KEYPAD;
+		state->mode |= TERM_MODE_APP_KEYPAD;
 	} else if(escape == '>') {
-		state->mode &= ~(TERM_APP_KEYPAD);
+		state->mode &= ~(TERM_MODE_APP_KEYPAD);
+	} else if(escape == '7') {
+		state->saved_col = state->col;
+		state->saved_row = state->row;
+	} else if(escape == '8') {
+		state->col = state->saved_col;
+		state->row = state->saved_row;
 	} else {
 		printf("Unknown Escape Format: \\x1b%c\n", escape);
 	}
@@ -973,7 +1020,23 @@ void term_event(term_ctx_t *term) {
 			break;
 		} else if(pfd.revents & POLLIN) {
 			c = tty_read_utf32(term->ptmx);
-			if(term->col >= term->max_cols) {
+			if(c == UTF8_ESCAPE) {
+				process_escape(term);
+				continue;
+			}
+			if(c == '\a') {
+				continue;
+			}
+			if(c == '\b') {
+				if(term->col)
+					term->col--;
+				continue;
+			}
+			if(c == '\r') {
+				term->col = 0;
+				continue;
+			}
+			if(term->col == term->max_cols) {
 				term->row++;
 				term->col = 0;
 			}
@@ -986,24 +1049,11 @@ void term_event(term_ctx_t *term) {
 					term->screen[term->row][i].utf32 = ' ';
 				}
 			}
-			if(c == UTF8_ESCAPE) {
-				process_escape(term);
-				continue;
-			}
 			if(c == '\t') {
 				for(int32_t i = 0; i < 8 - (term->col % 8); ++i) {
 					term->screen[term->row][term->col + i].utf32 = ' ';
 				}
 				term->col += 8 - (term->col % 8);
-				continue;
-			}
-			if(c == '\a') {
-				continue;
-			}
-			if(c == '\b') {
-				
-				if(term->col)
-					term->col--;
 				continue;
 			}
 			if(c == '\n') {
@@ -1032,11 +1082,39 @@ void term_event(term_ctx_t *term) {
 	close(fd);
 }
 
-static void send_csi(int ptmx, char c) {
-	char buffer[4] = "\x1b[0";
+static void send_arrow_key(term_ctx_t *term, char c) {
+	char csi_buffer[4] = "\x1b[0";
+	char ss3_buffer[4] = "\x1bO0";
 
-	buffer[2] = c;
-	write(ptmx, buffer, sizeof(buffer));
+	if(term->mode & TERM_MODE_APP_CURSOR_KEYS) {
+		ss3_buffer[2] = c;
+		write(term->ptmx, ss3_buffer, sizeof(ss3_buffer));
+	} else {
+		csi_buffer[2] = c;
+		write(term->ptmx, csi_buffer, sizeof(csi_buffer));
+	}
+}
+
+static void term_free_screen(term_cell_t **scr, int32_t rows) {
+	for(int32_t r = 0; r < rows; r++) {
+		free(scr[r]);
+	}
+	free(scr);
+}
+
+static term_cell_t **term_allocate_screen(int32_t rows, int32_t cols) {
+	term_cell_t **new = malloc(rows * sizeof(term_cell_t*));
+	if(new == NULL) return NULL;
+
+	for(int32_t r = 0; r < rows; r++) {
+		new[r] = malloc(cols * sizeof(term_cell_t));
+		if(new[r] == NULL) {
+			term_free_screen(new, r);
+			return NULL;
+		}
+	}
+
+	return new;
 }
 
 void term_handle_configure(void *data, uint32_t width, uint32_t height) {
@@ -1046,29 +1124,36 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	int32_t rows = term->height / term->y_advance;
 	int32_t cols = term->width / term->x_advance;
 
-	if(rows != term->max_rows || cols != term->max_cols) {
-		term_cell_t **new = malloc(rows * sizeof(term_cell_t *));
-		for(int32_t r = 0; r < rows; r++) {
-			new[r] = calloc(cols, sizeof(term_cell_t));
-			for(int32_t c = 0; c < cols; c++) {
-				new[r][c].fg = term->def_fg;
-				new[r][c].bg = term->def_bg;
-				new[r][c].attributes = 0;
-				new[r][c].utf32 = ' ';
-			}
-			if(r < term->max_rows) {
-				memcpy(new[r], term->screen[r], MIN(cols, term->max_cols) * sizeof(term_cell_t));
+	if(rows != term->max_rows && cols != term->max_cols) {
+		term_cell_t **new_primary = term_allocate_screen(rows, cols);
+		term_cell_t **new_alt = term_allocate_screen(rows, cols);
+		for(int32_t r = 0; r < rows; ++r) {
+			for(int32_t c = 0; c < cols; ++c) {
+				new_primary[r][c].utf32 = ' ';
+				new_primary[r][c].fg = term->fg;
+				new_primary[r][c].bg = term->bg;
+				new_primary[r][c].attributes = 0;
+				new_alt[r][c].utf32 = ' ';
+				new_alt[r][c].fg = term->fg;
+				new_alt[r][c].bg = term->bg;
+				new_alt[r][c].attributes = 0;
 			}
 		}
-
-		for(int32_t r = 0; r < term->max_rows; r++) {
-			free(term->screen[r]);
+		for(int32_t r = 0; r < MIN(term->max_rows, rows); r++) {
+				memcpy(new_primary[r], term->primary[r], MIN(cols, term->max_cols) * sizeof(term_cell_t));
+				memcpy(new_alt[r], term->altscreen[r], MIN(cols, term->max_cols) * sizeof(term_cell_t));
 		}
-		free(term->screen);
-
-		term->screen = new;
-		term->max_rows = rows;
+		if(term->screen == term->altscreen) {
+			term->screen = new_alt;
+		} else {
+			term->screen = new_primary;
+		}
+		term_free_screen(term->primary, term->max_rows);
+		term_free_screen(term->altscreen, term->max_rows);
+		term->primary = new_primary;
+		term->altscreen = new_alt;
 		term->max_cols = cols;
+		term->max_rows = rows;
 	}
 
 	struct winsize wsz = { rows, cols, width, height };
@@ -1087,13 +1172,13 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 void term_handle_cliboard_str(void *data, const char *str) {
 	term_ctx_t *term = (term_ctx_t*)data;
 
-	if(term->mode & TERM_BRACKTED_PASTE_MODE) {
+	if(term->mode & TERM_MODE_BRACKTED_PASTE) {
 		write(term->ptmx, TERM_BRACKTED_PASTE_START_STR, strlen(TERM_BRACKTED_PASTE_START_STR));
 	}
 
 	write(term->ptmx, str, strlen(str));
 
-	if(term->mode & TERM_BRACKTED_PASTE_MODE) {
+	if(term->mode & TERM_MODE_BRACKTED_PASTE) {
 		write(term->ptmx, TERM_BRACKTED_PASTE_END_STR, strlen(TERM_BRACKTED_PASTE_END_STR));
 	}
 }
@@ -1105,36 +1190,37 @@ typedef struct term_app_keypad_strs {
 
 /*Based on VT102/220 keypad*/
 static const term_app_keypad_strs_t app_keypad[] = {
-	{ XKB_KEY_space, "\x1bO " },
-	{ XKB_KEY_Tab, "\x1bOI" },
-	{ XKB_KEY_Return, "\x1bOM" },
-	{ XKB_KEY_asterisk, "\x1bOj" },
-	{ XKB_KEY_plus, "\x1bOk" },
-	{ XKB_KEY_comma, "\x1bOl" },
-	{ XKB_KEY_minus, "\x1bOm" },
-	{ XKB_KEY_period, "\x1bOn" },
-	{ XKB_KEY_division, "\x1bOo" },
-	{ XKB_KEY_0, "\x1bOp" },
-	{ XKB_KEY_1, "\x1bOq" },
-	{ XKB_KEY_2, "\x1bOr" },
-	{ XKB_KEY_3, "\x1bOs" },
-	{ XKB_KEY_4, "\x1bOt" },
-	{ XKB_KEY_5, "\x1bOu" },
-	{ XKB_KEY_6, "\x1bOv" },
-	{ XKB_KEY_7, "\x1bOw" },
-	{ XKB_KEY_8, "\x1bOx" },
-	{ XKB_KEY_9, "\x1bOy" },
-	{ XKB_KEY_equal, "\x1bOX" },
-	{ XKB_KEY_Up, "\x1bOA" },
-	{ XKB_KEY_Down, "\x1bOB" },
-	{ XKB_KEY_Left, "\x1bOD" },
-	{ XKB_KEY_Right, "\x1bOC" },
-	{ XKB_KEY_Insert, "\x1b[2~" },
-	{ XKB_KEY_Delete, "\x1b[3~" },
-	{ XKB_KEY_Home, "\x1b[1~" },
-	{ XKB_KEY_End, "\x1b[4~" },
-	{ XKB_KEY_Page_Up, "\x1b[5~" },
-	{ XKB_KEY_Page_Down, "\x1b[6~" },
+	{ XKB_KEY_KP_Space, "\x1bO " },
+	{ XKB_KEY_KP_Tab, "\x1bOI" },
+	{ XKB_KEY_KP_Enter, "\x1bOM" },
+	{ XKB_KEY_KP_Multiply, "\x1bOj" },
+	{ XKB_KEY_KP_Add, "\x1bOk" },
+	{ XKB_KEY_KP_Separator, "\x1bOl" },
+	{ XKB_KEY_KP_Subtract, "\x1bOm" },
+	{ XKB_KEY_KP_Decimal, "\x1bOn" },
+	{ XKB_KEY_KP_Divide, "\x1bOo" },
+	{ XKB_KEY_KP_0, "\x1bOp" },
+	{ XKB_KEY_KP_1, "\x1bOq" },
+	{ XKB_KEY_KP_2, "\x1bOr" },
+	{ XKB_KEY_KP_3, "\x1bOs" },
+	{ XKB_KEY_KP_4, "\x1bOt" },
+	{ XKB_KEY_KP_5, "\x1bOu" },
+	{ XKB_KEY_KP_6, "\x1bOv" },
+	{ XKB_KEY_KP_7, "\x1bOw" },
+	{ XKB_KEY_KP_8, "\x1bOx" },
+	{ XKB_KEY_KP_9, "\x1bOy" },
+	{ XKB_KEY_KP_Equal, "\x1bOX" },
+	{ XKB_KEY_KP_Up, "\x1bOA" },
+	{ XKB_KEY_KP_Down, "\x1bOB" },
+	{ XKB_KEY_KP_Left, "\x1bOD" },
+	{ XKB_KEY_KP_Right, "\x1bOC" },
+	
+	{ XKB_KEY_KP_Insert, "\x1b[2~" },
+	{ XKB_KEY_KP_Delete, "\x1b[3~" },
+	{ XKB_KEY_KP_Home, "\x1b[1~" },
+	{ XKB_KEY_KP_End, "\x1b[4~" },
+	{ XKB_KEY_KP_Page_Up, "\x1b[5~" },
+	{ XKB_KEY_KP_Page_Down, "\x1b[6~" },
 	{ XKB_KEY_F1, "\x1b[11~" },
 	{ XKB_KEY_F2, "\x1b[12~" },
 	{ XKB_KEY_F3, "\x1b[13~" },
@@ -1154,6 +1240,7 @@ int term_handle_key_application(term_ctx_t *ctx, uint32_t key) {
 
 	for(uint32_t i = 0; i < sizeof(app_keypad) / sizeof(app_keypad[0]); i++) {
 		if(keysym == app_keypad[i].keysym) {
+			printf("writing: %s\n", app_keypad[i].str);
 			write(ctx->ptmx, app_keypad[i].str, strlen(app_keypad[i].str));
 			return 1;
 		}
@@ -1170,7 +1257,7 @@ void term_handle_key(void *data, uint32_t key, uint32_t state) {
 		return;
 	}
 
-	if(term->mode & TERM_APP_KEYPAD) {
+	if(term->mode & TERM_MODE_APP_KEYPAD) {
 		if(term_handle_key_application(term, key))
 			return;
 	}
@@ -1187,13 +1274,13 @@ void term_handle_key(void *data, uint32_t key, uint32_t state) {
 
 	keysym = xkb_state_key_get_one_sym(term->state, key);
 	if(keysym == XKB_KEY_Up) {
-		send_csi(term->ptmx, 'A');
+		send_arrow_key(term, 'A');
 	} else if(keysym == XKB_KEY_Down) {
-		send_csi(term->ptmx, 'B');
+		send_arrow_key(term, 'B');
 	} else if(keysym == XKB_KEY_Left) {
-		send_csi(term->ptmx, 'D');
+		send_arrow_key(term, 'D');
 	} else if(keysym == XKB_KEY_Right) {
-		send_csi(term->ptmx, 'C');
+		send_arrow_key(term, 'C');
 	} else {
 		/*Convert to UTF8*/
 		xkb_state_key_get_utf8(term->state, key, utf8, 5);
@@ -1333,10 +1420,10 @@ int main(int argc, char **argv) {
 
 	term->max_rows = INITIAL_ROW_MAX;
 	term->max_cols = INITIAL_COLUMN_MAX;
-	term->screen = calloc(term->max_rows, sizeof(term_cell_t *));
-	for(int32_t i = 0; i < term->max_rows; ++i) {
-		term->screen[i] = calloc(term->max_cols, sizeof(term_cell_t));
-	}
+
+	term->primary = term_allocate_screen(term->max_rows, term->max_cols);
+	term->altscreen = term_allocate_screen(term->max_rows, term->max_cols);
+	term->screen = term->primary;
 
 	term->features[0].tag = HB_TAG('c', 'a', 'l', 't');
 	term->features[0].value = 1;
@@ -1382,6 +1469,7 @@ int main(int argc, char **argv) {
 
 	term->def_fg = term->fg;
 	term->def_bg = term->bg;
+	term->mode |= TERM_MODE_SHOW_CURSOR;
 
 	const char *fname = find_font_file(font_name);
 	if(fname == NULL) {
@@ -1474,10 +1562,8 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	for(int32_t r = 0; r < term->max_rows; ++r) {
-		free(term->screen[r]);
-	}
-	free(term->screen);
+	term_free_screen(term->primary, term->max_rows);
+	term_free_screen(term->altscreen, term->max_rows);
 
 	term->dpy->deinit(term->dpy);
 	hb_font_destroy(term->hb_font);
