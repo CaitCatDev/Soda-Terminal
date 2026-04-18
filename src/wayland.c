@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <linux/input-event-codes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -209,7 +210,12 @@ static const struct wl_keyboard_listener wl_keyboard_listener = {
 
 
 void wl_pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
-	UNUSED(data);
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+
+	if(wl->base.callbacks.pointer_focus) {
+		wl->base.callbacks.pointer_focus(wl->base.data, 1);
+	}
+
 	UNUSED(pointer);
 	UNUSED(serial);
 	UNUSED(surface);
@@ -218,26 +224,47 @@ void wl_pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t se
 }
 
 void wl_pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface) {
-	UNUSED(data);
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+
+	if(wl->base.callbacks.pointer_focus) {
+		wl->base.callbacks.pointer_focus(wl->base.data, 0);
+	}
+
 	UNUSED(pointer);
 	UNUSED(serial);
 	UNUSED(surface);
 }
 
 void wl_pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
-	UNUSED(data);
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+
+	if(wl->base.callbacks.pointer_motion) {
+		wl->base.callbacks.pointer_motion(wl->base.data, wl_fixed_to_int(x), wl_fixed_to_int(y));
+	}
+
 	UNUSED(pointer);
 	UNUSED(time);
-	UNUSED(x);
-	UNUSED(y);
 }
 
 void wl_pointer_handle_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
-	UNUSED(data);
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+
+	/*Terminal Mouse protocols encode buttons the
+	 * same as X so swap middle and right clicks
+	 * to make them match up with X and terminal
+	 * protocols
+	 */
+	if(button == BTN_MIDDLE) {
+		button = BTN_RIGHT;
+	} else if(button == BTN_RIGHT) {
+		button = BTN_MIDDLE;
+	}
+
+	if(wl->base.callbacks.pointer_button) {
+		wl->base.callbacks.pointer_button(wl->base.data, button - (BTN_MOUSE - 1), state);
+	}
 	UNUSED(pointer);
 	UNUSED(time);
-	UNUSED(button);
-	UNUSED(state);
 	UNUSED(serial);
 }
 

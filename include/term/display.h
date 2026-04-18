@@ -8,6 +8,8 @@ typedef struct term_display term_display_t;
 typedef struct {
 	void (*keymap_change)(void *data, struct xkb_keymap *keymap, struct xkb_state *state);
 	void (*pointer_motion)(void *data, int32_t x, int32_t y);
+	void (*pointer_button)(void *data, uint32_t btn, uint32_t state);
+	void (*pointer_focus)(void *data, uint32_t state);
 	void (*keypress)(void *data, uint32_t key, uint32_t state);
 	void (*repeat_info)(void *data, int32_t rate, int32_t delay);
 	void (*configure)(void *data, uint32_t width, uint32_t height);

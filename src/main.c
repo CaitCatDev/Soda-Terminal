@@ -106,6 +106,7 @@ typedef struct widget_label {
 typedef struct term_ctx_s {
 	int ptmx;
 	int running;
+	int dirty;
 
 	term_font_t *font;
 	hb_feature_t features[1];
@@ -137,6 +138,8 @@ typedef struct term_ctx_s {
 	uint32_t width;
 	uint32_t height;
 	uint32_t mode;
+	int32_t x, y;
+	uint32_t button_state;
 } term_ctx_t;
 
 #define TERM_MODE_BRACKTED_PASTE (1 << 0)
@@ -144,6 +147,12 @@ typedef struct term_ctx_s {
 #define TERM_MODE_APP_CURSOR_KEYS (1 << 2)
 #define TERM_MODE_SHOW_CURSOR (1 << 3)
 #define TERM_MODE_ALT_SCREEN (1 << 4)
+#define TERM_MODE_MOUSE_X10 (1 << 5)
+#define TERM_MODE_MOUSE_NORMAL (1 << 6)
+#define TERM_MODE_MOUSE_BUTTON (1 << 7)
+#define TERM_MODE_MOUSE_MOTION_ALL (1 << 8)
+#define TERM_MODE_MOUSE_FOCUS (1 << 9)
+#define TERM_MODE_MOUSE_SGR (1 << 10)
 
 #define TERM_BRACKTED_PASTE_START_STR "\x1b[200~"
 #define TERM_BRACKTED_PASTE_END_STR "\x1b[201~"
@@ -705,6 +714,18 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 				case 'h':
 					if(parameters[0] == 1) {
 						term->mode |= (TERM_MODE_APP_CURSOR_KEYS);
+					} else if(parameters[0] == 9) {
+						term->mode |= (TERM_MODE_MOUSE_X10);
+					} else if(parameters[0] == 1000) { /*enable Mouse tracking on button*/
+						term->mode |= (TERM_MODE_MOUSE_NORMAL);
+					} else if(parameters[0] == 1002) {
+						term->mode |= (TERM_MODE_MOUSE_BUTTON);
+					} else if(parameters[0] == 1003) {
+						term->mode |= (TERM_MODE_MOUSE_MOTION_ALL);
+					} else if(parameters[0] == 1004) {
+						term->mode |= (TERM_MODE_MOUSE_FOCUS);
+					} else if(parameters[0] == 1006) {
+						term->mode |= (TERM_MODE_MOUSE_SGR);
 					} else if(parameters[0] == 1049) {
 						term->mode |= (TERM_MODE_ALT_SCREEN);
 						term->screen = term->altscreen;
@@ -721,6 +742,18 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 				case 'l':
 					if(parameters[0] == 1) {
 						term->mode &= ~(TERM_MODE_APP_CURSOR_KEYS);
+					} else if(parameters[0] == 9) {
+						term->mode &= ~(TERM_MODE_MOUSE_X10);
+					} else if(parameters[0] == 1000) {
+						term->mode &= ~(TERM_MODE_MOUSE_NORMAL);
+					} else if(parameters[0] == 1002) {
+						term->mode &= ~(TERM_MODE_MOUSE_BUTTON);
+					} else if(parameters[0] == 1003) {
+						term->mode &= ~(TERM_MODE_MOUSE_MOTION_ALL);
+					} else if(parameters[0] == 1004) {
+						term->mode &= ~(TERM_MODE_MOUSE_FOCUS);
+					} else if(parameters[0] == 1006) {
+						term->mode &= ~(TERM_MODE_MOUSE_SGR);
 					} else if(parameters[0] == 1049) {
 						term->mode &= ~(TERM_MODE_ALT_SCREEN);
 						term->col = term->saved_col;
@@ -741,6 +774,7 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 			break;
 		default:
 			switch(mode) {
+				case 'f':
 				case 'H':
 					if(param_count == 0) {
 						term->row = 0;
@@ -814,27 +848,23 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 					break;
 				case 'A':
 					if(parameters[0] == 0) parameters[0]++;
-					while(parameters[0]--) {
-						term->row--;
-					};
+					term->row -= parameters[0];
+					if(term->row < 0) term->row = 0;
 					break;
 				case 'B':
 					if(parameters[0] == 0) parameters[0]++;
-					while(parameters[0]--) {
-						term->row++;
-					}
+					term->row += parameters[0];
+					if(term->row >= term->max_rows) term->row = term->max_rows - 1;
 					break;
 				case 'C':
 					if(parameters[0] == 0) parameters[0]++;
-					while(parameters[0]--) {
-						term->col++;
-					}
-					break;
+					term->col += parameters[0];
+					if(term->col >= term->max_cols) term->col = term->max_cols - 1;
 				case 'D':
 					if(parameters[0] == 0) parameters[0]++;
-					while(parameters[0]--) {
-						term->col--;
-					}
+					
+					term->col -= parameters[0];
+					if(term->col < 0) term->col = 0; 
 					break;
 				case 'G':
 					if(parameters[0] == 0) parameters[0]++;
@@ -910,7 +940,6 @@ void handle_strescape(term_ctx_t *state, char byte) {
 	log_debug("Unknown Escape Sequence: %s\n", escape);
 }
 
-
 void process_escape(term_ctx_t *state) {
 	char escape = 0;
 
@@ -918,7 +947,7 @@ void process_escape(term_ctx_t *state) {
 	if(escape == '[') {
 		handle_csi(state);
 		return;
-	} else if(escape == ']' || escape == 'P') {
+	} else if(escape == ']' || escape == 'P' || escape == 'k') {
 		handle_strescape(state, escape);
 		return;
 	} else if(escape == '(') {
@@ -957,7 +986,7 @@ uint32_t tty_read_utf32(int fd) {
 		return (((uint32_t)(b1 & 0x07) << 18) | ((uint32_t)(extbytes[0] & 0x3f) << 12) | ((uint32_t)(extbytes[1] & 0x3f) << 6) | ((uint32_t)extbytes[2] & 0x3f));
 	}
 
-	log_error("UTF8 sequence longer than 4 bytes");
+	log_error("UTF8 sequence longer than 4 bytes %d", b1);
 	return 0;
 }
 
@@ -987,7 +1016,7 @@ void term_event(term_ctx_t *term) {
 				term->col = 0;
 				continue;
 			}
-			if(term->col == term->max_cols) {
+			if(term->col >= term->max_cols) {
 				term->row++;
 				term->col = 0;
 			}
@@ -1068,6 +1097,83 @@ static term_cell_t **term_allocate_screen(int32_t rows, int32_t cols) {
 	return new;
 }
 
+static void term_mouse_report(term_ctx_t *term, bool motion, uint32_t btn, uint32_t state, int32_t x, int32_t y) {
+	char buffer[64] = { 0 };
+	size_t len = 0;
+	uint32_t i = 0;
+	uint8_t c = 0;
+	x /= term->font->xadv;
+	y /= term->font->yadv;
+
+	if(motion) {
+		for(i = 0; i < 3; i++) {
+			if(term->button_state & (1 << i)) {
+				break;
+			}
+		}
+
+		c += 32 + i;
+	} else {
+		c += state ? btn - 1 : 3;
+	}
+
+
+	if(term->mode & TERM_MODE_MOUSE_SGR) {
+		len = snprintf(buffer, 64, "\x1b[<%d;%d;%d%c", c, x+1, y+1, (state | motion) ? 'M' : 'm');
+		write(term->ptmx, buffer, len);
+		return;
+	}
+	
+	if(term->mode & TERM_MODE_MOUSE_X10 && state == 0) return;
+	if(x < 223 && y < 223) return;
+
+	if(term->mode & (TERM_MODE_MOUSE_X10 | TERM_MODE_MOUSE_NORMAL | TERM_MODE_MOUSE_MOTION_ALL | TERM_MODE_MOUSE_BUTTON)) {
+		len = snprintf(buffer, 64, "\x1b[M%c%c%c", ' '+c, ' '+x+1, ' '+y+1);
+		write(term->ptmx, buffer, 6);
+	}
+
+}
+
+void term_handle_motion(void *data, int32_t x, int32_t y) {
+	term_ctx_t *term = (term_ctx_t*)data;
+
+	term->x = x;
+	term->y = y;
+
+	if((term->button_state && term->mode & TERM_MODE_MOUSE_BUTTON) || term->mode & TERM_MODE_MOUSE_MOTION_ALL) {
+		term_mouse_report(term, true, 0, 0, term->x, term->y);
+	}
+}
+
+void term_handle_pointer_focus(void *data, uint32_t state) {
+	char buffer[4] = "\x1b[O";
+	term_ctx_t *term = (term_ctx_t*)data;
+
+	if(state) buffer[2] = 'I';
+
+	if(term->mode & TERM_MODE_MOUSE_FOCUS) {
+		write(term->ptmx, buffer, 3);
+	}
+}
+
+void term_handle_button(void *data, uint32_t button, uint32_t state) {
+	term_ctx_t *term = (term_ctx_t*)data;
+
+	if(button > BTN_MIDDLE) {
+		printf("Unrecognized button pressed %d\n", button);
+		return;
+	}
+
+	if(state) {
+		term->button_state |= 1 << (button - 1);
+	} else {
+		term->button_state &= ~(1<<(button - 1));
+	}
+	if(term->mode & (TERM_MODE_MOUSE_NORMAL | TERM_MODE_MOUSE_BUTTON | TERM_MODE_MOUSE_MOTION_ALL | TERM_MODE_MOUSE_X10)) {
+		term_mouse_report(term, false, button, state, term->x, term->y);
+	}
+}
+
 void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	term_ctx_t *term = data;
 	term->width = width;
@@ -1075,7 +1181,7 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	int32_t rows = term->height / term->font->yadv;
 	int32_t cols = term->width / term->font->xadv;
 
-	if(rows != term->max_rows && cols != term->max_cols) {
+	if(rows != term->max_rows || cols != term->max_cols) {
 		term_cell_t **new_primary = term_allocate_screen(rows, cols);
 		term_cell_t **new_alt = term_allocate_screen(rows, cols);
 		for(int32_t r = 0; r < rows; ++r) {
@@ -1106,6 +1212,9 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 		term->max_cols = cols;
 		term->max_rows = rows;
 	}
+
+	if(term->max_cols <= term->col) term->col = term->max_cols - 1;
+	if(term->max_rows <= term->row) term->row = term->max_rows - 1;
 
 	struct winsize wsz = { rows, cols, width, height };
 	ioctl(term->ptmx, TIOCSWINSZ, &wsz);
@@ -1240,6 +1349,8 @@ void term_handle_key(void *data, uint32_t key, uint32_t state) {
 
 		write(term->ptmx, utf8, strlen(utf8));
 	}
+
+	term->dirty = 1;
 }
 
 void term_handle_keymap(void *data, struct xkb_keymap *keymap, struct xkb_state *state) {
@@ -1468,7 +1579,9 @@ int main(int argc, char **argv) {
 	term->dpy->callbacks.close = term_handle_close;
 	term->dpy->callbacks.configure = term_handle_configure;
 	term->dpy->callbacks.clipboard_str_callback = term_handle_cliboard_str;
-
+	term->dpy->callbacks.pointer_motion = term_handle_motion;
+	term->dpy->callbacks.pointer_button = term_handle_button;
+	term->dpy->callbacks.pointer_focus = term_handle_pointer_focus;
 	struct pollfd pfds[1] = { 0 };
 
 	pfds[0].events = POLLIN;
@@ -1479,12 +1592,22 @@ int main(int argc, char **argv) {
 
 	while(term->running) {
 		term->dpy->dispatch(term->dpy);
-		poll(pfds, 1, 0);
+		poll(pfds, 1, 50);
 		if(pfds[0].revents & POLLIN) {
 			term_event(term);
 		} else if(pfds[0].revents & (POLLHUP | POLLERR)) {
 			term->running = 0;
 			break;
+		}
+		if(term->dirty) {
+			int fd = draw_frame(term);
+			if(fd == -1) {
+				log_error("draw_frame failed: %s\n", strerror(errno));
+				term->running = 0;
+			}
+			term->dpy->attach_shm(term->dpy, fd, term->width, term->height, term->width * 4, term->width * 4 * term->height, 0, FORMAT_ARGB8888);
+			close(fd);
+			term->dirty = 0;
 		}
 	}
 

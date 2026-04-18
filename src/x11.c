@@ -247,7 +247,6 @@ static void x11_handle_selection_notify(xcb_term_display_t *xcb, xcb_generic_eve
 		return;
 	}
 
-
 	memcpy(str, xcb_get_property_value(reply), xcb_get_property_value_length(reply));
 	free(reply);
 	if(xcb->base.callbacks.clipboard_str_callback) {
@@ -257,6 +256,36 @@ static void x11_handle_selection_notify(xcb_term_display_t *xcb, xcb_generic_eve
 	xcb_delete_property(xcb->connection, xcb->window, xcb->property);
 	xcb_flush(xcb->connection);
 	free(str);
+}
+
+static void x11_handle_motion(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_motion_notify_event_t *motion = (xcb_motion_notify_event_t*)ev;
+
+	if(xcb->base.callbacks.pointer_motion) {
+		xcb->base.callbacks.pointer_motion(xcb->base.data, motion->event_x, motion->event_y);
+	}
+}
+
+static void x11_handle_button(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	xcb_button_press_event_t *btn = (xcb_button_press_event_t*)ev;
+	uint32_t pressed = 0;
+	if(btn->response_type == XCB_BUTTON_PRESS) pressed = 1;
+
+	if(xcb->base.callbacks.pointer_button) {
+		xcb->base.callbacks.pointer_button(xcb->base.data, btn->detail, pressed);
+	}
+}
+
+static void x11_handle_focus_change(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+	uint32_t focus = 0;
+	if(ev->response_type == XCB_FOCUS_IN) {
+		focus = 1;
+	}
+
+	if(xcb->base.callbacks.pointer_focus) {
+		xcb->base.callbacks.pointer_focus(xcb->base.data, focus);
+	}
+
 }
 
 static void x11_handle_core_event(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
@@ -275,6 +304,17 @@ static void x11_handle_core_event(xcb_term_display_t *xcb, xcb_generic_event_t *
 			break;
 		case XCB_SELECTION_NOTIFY:
 			x11_handle_selection_notify(xcb, ev);
+			break;
+		case XCB_FOCUS_IN:
+		case XCB_FOCUS_OUT:
+			x11_handle_focus_change(xcb, ev);
+			break;
+		case XCB_BUTTON_PRESS:
+		case XCB_BUTTON_RELEASE:
+			x11_handle_button(xcb, ev);
+			break;
+		case XCB_MOTION_NOTIFY:
+			x11_handle_motion(xcb, ev);
 			break;
 		case 0:
 			x11_handle_error(xcb, (xcb_generic_error_t*)ev);
@@ -458,7 +498,7 @@ term_display_t *term_x11_display_init(void) {
 	uint32_t winevents = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY |
 											 XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |
 											 XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
-											 XCB_EVENT_MASK_POINTER_MOTION;
+											 XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_FOCUS_CHANGE;
 	uint32_t mask = XCB_CW_BACK_PIXMAP | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP;
 	uint32_t values[] = { XCB_PIXMAP_NONE, 0x000000, winevents, xcb->colormap };
 

@@ -79,7 +79,7 @@ __error_config:
 }
 
 void term_font_destroy(term_font_t *font) {
-	if(font) return;
+	if(!font) return;
 
 	hb_font_destroy(font->hb_font);
 
