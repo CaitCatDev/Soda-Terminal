@@ -37,12 +37,6 @@
 #include <term/font.h>
 #include <term/log.h>
 
-#if defined(__FreeBSD__)
-#include <dev/evdev/input-event-codes.h>
-#elif defined(__linux__)
-#include <linux/input-event-codes.h>
-#endif
-
 #include "freetype/freetype.h"
 
 #define FORMAT_ARGB8888 0
@@ -891,14 +885,15 @@ void exec_csi(term_ctx_t *term, const char *csi, uint32_t len) {
 				case 'q':
 					switch(intermediate) {
 						case ' ':
-							if(parameters[1] < 3) {
+							if(parameters[0] < 3) {
 								term->cursor = cursors[0];
-							} else if(parameters[1] < 5) {
+							} else if(parameters[0] < 5) {
 								term->cursor = cursors[1];
 							} else {
 								term->cursor = cursors[2];
 							}
 					}
+					break;
 				default:
 					goto unknown_csi;
 			}
@@ -930,14 +925,12 @@ void handle_strescape(term_ctx_t *state, char byte) {
 	char escape[4096] = { 0 };
 	uint32_t i = 1;
 	escape[0] = byte;
-
 	do {
 		read(state->ptmx, &escape[i], 1);
 		if(escape[i] == '\a') break;
 		if(strcmp(&escape[i-1], "\x1b\\") == 0) break;
 		i++;
 	} while(i < 4095);
-	log_debug("Unknown Escape Sequence: %s\n", escape);
 }
 
 void process_escape(term_ctx_t *state) {
@@ -986,8 +979,8 @@ uint32_t tty_read_utf32(int fd) {
 		return (((uint32_t)(b1 & 0x07) << 18) | ((uint32_t)(extbytes[0] & 0x3f) << 12) | ((uint32_t)(extbytes[1] & 0x3f) << 6) | ((uint32_t)extbytes[2] & 0x3f));
 	}
 
-	log_error("UTF8 sequence longer than 4 bytes %d", b1);
-	return 0;
+	log_warn("Invalid UTF-8 sequence returning as CTRL char %x\n", b1);
+	return b1;
 }
 
 void term_event(term_ctx_t *term) {
@@ -1036,7 +1029,7 @@ void term_event(term_ctx_t *term) {
 				term->col += 8 - (term->col % 8);
 				continue;
 			}
-			if(c == '\n') {
+			if(c == 0x84 || c == '\n') {
 				term->row++;
 				continue;
 			}
@@ -1128,7 +1121,7 @@ static void term_mouse_report(term_ctx_t *term, bool motion, uint32_t btn, uint3
 	if(x < 223 && y < 223) return;
 
 	if(term->mode & (TERM_MODE_MOUSE_X10 | TERM_MODE_MOUSE_NORMAL | TERM_MODE_MOUSE_MOTION_ALL | TERM_MODE_MOUSE_BUTTON)) {
-		len = snprintf(buffer, 64, "\x1b[M%c%c%c", ' '+c, ' '+x+1, ' '+y+1);
+		snprintf(buffer, 64, "\x1b[M%c%c%c", ' '+c, ' '+x+1, ' '+y+1);
 		write(term->ptmx, buffer, 6);
 	}
 
@@ -1159,9 +1152,8 @@ void term_handle_pointer_focus(void *data, uint32_t state) {
 void term_handle_button(void *data, uint32_t button, uint32_t state) {
 	term_ctx_t *term = (term_ctx_t*)data;
 
-	if(button > BTN_MIDDLE) {
-		printf("Unrecognized button pressed %d\n", button);
-		return;
+	if(button > 3) {
+		printf("Unrecognized button %d\n", button);
 	}
 
 	if(state) {
@@ -1600,6 +1592,7 @@ int main(int argc, char **argv) {
 			break;
 		}
 		if(term->dirty) {
+			if(term->dirty == 2) continue;
 			int fd = draw_frame(term);
 			if(fd == -1) {
 				log_error("draw_frame failed: %s\n", strerror(errno));

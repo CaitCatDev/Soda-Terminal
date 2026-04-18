@@ -1,5 +1,4 @@
 #include <fcntl.h>
-#include <linux/input-event-codes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,6 +19,12 @@
 
 #include <wayland-util.h>
 #include <xkbcommon/xkbcommon.h>
+
+#if defined(__FreeBSD__)
+#include <dev/evdev/input-event-codes.h>
+#elif defined(__linux__)
+#include <linux/input-event-codes.h>
+#endif
 
 #include <xdg-shell-client-protocol.h>
 
