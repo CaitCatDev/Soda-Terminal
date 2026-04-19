@@ -40,7 +40,7 @@ if wayland_protocols.found()
     )
 endif
 
-srcs = [ './src/main.c', './src/log.c', './src/font.c' ]
+srcs = [ './src/main.c', './src/log.c', './src/font.c', './src/vt.c' ]
 inc = include_directories('./include/')
 
 if xcb.found()

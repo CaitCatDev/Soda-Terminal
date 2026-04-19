@@ -18,6 +18,7 @@ int log_init(const char *path, log_level_t level, bool only_level);
 void log_set_file(FILE *fp);
 void log_close_file(void);
 void log_printf(const char *file, uint32_t line, log_level_t level, const char *fmt, ...);
+void log_printf_raw(log_level_t level, const char *fmt, ...);
 
 #define log_info(...) log_printf(__FILE__, __LINE__, TERM_LOG_LEVEL_INFO, __VA_ARGS__)
 #define log_debug(...) log_printf(__FILE__, __LINE__, TERM_LOG_LEVEL_DEBUG, __VA_ARGS__)

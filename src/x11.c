@@ -163,10 +163,6 @@ static void x11_handle_xkb_event(xcb_term_display_t *xcb, xcb_generic_event_t *e
 static void x11_handle_keypress(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_key_press_event_t *key = (xcb_key_release_event_t*)ev;
 	xcb->base.callbacks.keypress(xcb->base.data, key->detail, 1);
-	
-	if(key->detail == 24) {
-		xcb_convert_selection(xcb->connection, xcb->window, xcb->selection, xcb->target, xcb->property, XCB_CURRENT_TIME);
-	}
 }
 
 static void x11_handle_keyrelease(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {

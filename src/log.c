@@ -96,3 +96,14 @@ void log_printf(const char *file, uint32_t line, log_level_t level, const char *
 		va_end(args);
 	}
 }
+
+void log_printf_raw(log_level_t level, const char *fmt, ...) {
+	va_list args;
+
+	if((level >= log_level && only_level == false) ||
+		 (log_level & level && only_level == true)) {
+		va_start(args, fmt);
+		vfprintf(log_file, fmt, args);
+		va_end(args);
+	}
+}

@@ -1,3 +1,6 @@
+#ifdef __linux__
+	#define _XOPEN_SOURCE 600
+#endif
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -5,10 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/mman.h>
-#include <sys/poll.h>
 #include <unistd.h>
-
+#include <time.h>
 #include <poll.h>
 
 #include <wayland-client-core.h>
@@ -25,6 +26,9 @@
 #elif defined(__linux__)
 #include <linux/input-event-codes.h>
 #endif
+
+#include <sys/mman.h>
+#include <sys/timerfd.h>
 
 #include <xdg-shell-client-protocol.h>
 
@@ -53,6 +57,11 @@ typedef struct wl_ctx_s {
 	struct wl_keyboard *keyboard;
 	struct xkb_context *ctx;
 	struct xkb_keymap *keymap;
+	int timerfd;
+	uint32_t last_key;
+	uint32_t delay;
+	uint32_t rate;
+
 	struct xkb_state *state;
 
 	struct wl_pointer *pointer;
@@ -178,10 +187,29 @@ void wl_keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint32_t
 void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)data;
 	key += 8;
+	struct itimerspec repeat_rate = { 0 };
+	struct itimerspec nulltimer = { 0 };
+	repeat_rate.it_value.tv_nsec = wl->delay * 1000000;
+	repeat_rate.it_interval.tv_nsec = wl->rate * 1000000;
+
 
 	if(wl->base.callbacks.keypress) {
 		wl->base.callbacks.keypress(wl->base.data, key, state);
 	}
+	if(state) {
+		wl->last_key = key;
+		if(timerfd_settime(wl->timerfd, 0, &repeat_rate, NULL) < 0) {
+			log_error("Failed to arm key repeat timer\n");
+		}
+	} else {
+		if(wl->last_key == key) {
+			if(timerfd_settime(wl->timerfd, 0, &nulltimer, NULL)) {
+				log_error("Failed to disarm key repeat timer\n");
+				wl->base.callbacks.close(wl->base.data);
+			}
+		}
+	}
+
 	UNUSED(keyboard);
 	UNUSED(serial);
 	UNUSED(time);
@@ -196,10 +224,12 @@ void wl_keyboard_handle_modifiers(void *data, struct wl_keyboard *keyboard, uint
 }
 
 void wl_keyboard_handle_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
-	UNUSED(data);
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+
+	wl->rate = rate;
+	wl->delay = delay;
+
 	UNUSED(keyboard);
-	UNUSED(rate);
-	UNUSED(delay);
 }
 
 static const struct wl_keyboard_listener wl_keyboard_listener = {
@@ -475,10 +505,13 @@ int term_wl_display_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 
 void term_wl_display_dispatch(term_display_t *dpy) {
 	wayland_ctx_t *wl = (wayland_ctx_t *)dpy;
-	struct pollfd pfds[1] = { 0 };
+	struct pollfd pfds[2] = { 0 };
+	uint64_t timer_expirations = 0;
 
 	pfds[0].events = POLLIN;
 	pfds[0].fd = wl_display_get_fd(wl->display);
+	pfds[1].events = POLLIN;
+	pfds[1].fd = wl->timerfd;
 
 	while(1) {
 		while(wl_display_prepare_read(wl->display) != 0) {
@@ -486,7 +519,15 @@ void term_wl_display_dispatch(term_display_t *dpy) {
 		}
 		wl_display_flush(wl->display);
 
-		poll(pfds, 1, 0);
+		poll(pfds, 2, 0);
+		if(pfds[1].revents) {
+			read(wl->timerfd, &timer_expirations, sizeof(timer_expirations));
+			for(uint64_t exp = 0; exp < timer_expirations; exp++) {
+				if(dpy->callbacks.keypress) {
+					dpy->callbacks.keypress(dpy->data, wl->last_key, 2);
+				}
+			}
+		}
 		if(pfds[0].revents & POLLIN) {
 			wl_display_read_events(wl->display);
 			wl_display_dispatch_pending(wl->display);
@@ -494,6 +535,7 @@ void term_wl_display_dispatch(term_display_t *dpy) {
 			wl_display_cancel_read(wl->display);
 			break;
 		}
+
 	}
 }
 
@@ -645,6 +687,8 @@ void term_wl_display_request_clipboard(term_display_t *dpy) {
 void term_wl_display_deinit(term_display_t *dpy) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
 
+	close(wl->timerfd);
+
 	wl_surface_attach(wl->surface, NULL, 0, 0);
 	wl_display_roundtrip(wl->display);
 
@@ -744,6 +788,11 @@ term_display_t *term_wl_display_init(void) {
 		goto err_free_surface;
 	}
 	xdg_toplevel_add_listener(wl->xdg_toplevel, &xdg_toplevel_listener, wl);
+	wl->timerfd = timerfd_create(CLOCK_REALTIME, TFD_CLOEXEC);
+	if(wl->timerfd < 0) {
+		log_error("failed to create timer fd %s\n", strerror(errno));
+		goto err_free_surface;
+	}
 
 	wl->data_dev = wl_data_device_manager_get_data_device(wl->ddm, wl->seat);
 	wl_data_device_add_listener(wl->data_dev, &wl_data_device_listener, wl);
