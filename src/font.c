@@ -11,8 +11,8 @@
 
 #include <fontconfig/fontconfig.h>
 
-#include <term/log.h>
-#include <term/font.h>
+#include <soda-term/log.h>
+#include <soda-term/font.h>
 
 static const char *fc_result_to_string(FcResult result) {
 	switch(result) {
@@ -78,7 +78,7 @@ __error_config:
 	return output;
 }
 
-void term_font_destroy(term_font_t *font) {
+void soda_font_destroy(soda_font_t *font) {
 	if(!font) return;
 
 	hb_font_destroy(font->hb_font);
@@ -88,9 +88,9 @@ void term_font_destroy(term_font_t *font) {
 	free(font);
 }
 
-term_font_t *term_font_from_name(const char *name, uint32_t px) {
+soda_font_t *soda_font_from_name(const char *name, uint32_t px, hb_feature_t *features, uint32_t feature_count) {
 	FT_Error error;
-	term_font_t *font;
+	soda_font_t *font;
 	const char *filename;
 
 	filename = font_path_from_name(name);
@@ -99,7 +99,7 @@ term_font_t *term_font_from_name(const char *name, uint32_t px) {
 	}
 	log_debug("Font File: %s\n", filename);
 
-	font = calloc(1, sizeof(term_font_t));
+	font = calloc(1, sizeof(soda_font_t) + sizeof(hb_feature_t) * feature_count);
 	if(!font) {
 		log_error("font allocation failed\n");
 		goto err_free_filename;
@@ -133,7 +133,8 @@ term_font_t *term_font_from_name(const char *name, uint32_t px) {
 	}
 
 	hb_ft_font_set_load_flags(font->hb_font, FT_LOAD_DEFAULT);
-
+	memcpy(font->features, features, feature_count * sizeof(hb_feature_t));
+	font->feat_count = feature_count;
 
 	free((char*)filename);
 	return font;

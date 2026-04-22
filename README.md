@@ -1,5 +1,13 @@
-# PROJECT-TERMINAL
-a better name is pending but the goal is to make a Linux and X11 terminal supporting ligatures and rendering with OGL or VK.
+# Soda Terminal:
+Soda Terminal's goal is to make a Linux and BSD terminal emulator. That works both in X11 and Wayland(possibly more). Hoping to support Ligatures and rendering with OpenGL and Vulkan.
+
+## Features:
+- [x] X11 Backend
+- [x] WL Backend
+- [ ] Vulkan Rendering
+- [ ] OpenGL Rendering
+- [x] Ligatures
+- [x] Freetype Rendering
 
 ### Building:
 call either `make` for a full build or meson/muon and ninja/samurai to do a configurable build with to disable x11 or wl support.

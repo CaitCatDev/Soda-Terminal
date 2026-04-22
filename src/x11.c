@@ -15,8 +15,8 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-x11.h>
 
-#include <term/log.h>
-#include <term/display.h>
+#include <soda-term/log.h>
+#include <soda-term/display.h>
 
 #define UNUSED(x) (void)x
 
@@ -34,8 +34,8 @@ struct xid_free_list {
 	xid_free_list_t *next;
 };
 
-typedef struct x11_term_display {
-	term_display_t base;
+typedef struct x11_soda_display {
+	soda_display_t base;
 	xcb_connection_t *connection;
 	const xcb_setup_t *setup;
 	xcb_screen_t *screen;
@@ -65,7 +65,7 @@ typedef struct x11_term_display {
 
 	xcb_window_t window;
 	xcb_gcontext_t gc;
-} xcb_term_display_t;
+} xcb_soda_display_t;
 
 static const char *x11_error_code_to_str(uint8_t code) {
 	switch(code) {
@@ -100,7 +100,7 @@ static xid_free_list_t *xid_free_list_pop(xid_free_list_t **head) {
 	return node;
 }
 
-static uint32_t get_xid(xcb_term_display_t *xcb) {
+static uint32_t get_xid(xcb_soda_display_t *xcb) {
 	xid_free_list_t *node = xid_free_list_pop(&xcb->free_list);
 	uint32_t id = 0;
 
@@ -114,7 +114,7 @@ static uint32_t get_xid(xcb_term_display_t *xcb) {
 	return id;
 }
 
-static int xid_free(xcb_term_display_t *xcb, uint32_t id) {
+static int xid_free(xcb_soda_display_t *xcb, uint32_t id) {
 	xid_free_list_t *new = calloc(1, sizeof(xid_free_list_t));
 	if(!new) return -1;
 
@@ -123,8 +123,8 @@ static int xid_free(xcb_term_display_t *xcb, uint32_t id) {
 	return 0;
 }
 
-static int term_x11_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format) {
-	xcb_term_display_t *xcb = (xcb_term_display_t*)dpy;
+static int term_x11_attach_shm(soda_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format) {
+	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
 	int dupfd = dup(fd);/*X closes the FD So dup it*/
 
 	xcb_shm_seg_t shmseg = get_xid(xcb);
@@ -147,7 +147,7 @@ static int term_x11_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 	UNUSED(size);
 }
 
-static void x11_handle_xkb_event(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_xkb_event(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_xkb_state_notify_event_t *xkb_ev = (xcb_xkb_state_notify_event_t*)ev;
 
 	switch(xkb_ev->xkbType) {
@@ -160,29 +160,29 @@ static void x11_handle_xkb_event(xcb_term_display_t *xcb, xcb_generic_event_t *e
 	}
 }
 
-static void x11_handle_keypress(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_keypress(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_key_press_event_t *key = (xcb_key_release_event_t*)ev;
 	xcb->base.callbacks.keypress(xcb->base.data, key->detail, 1);
 }
 
-static void x11_handle_keyrelease(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_keyrelease(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_key_release_event_t *key = (xcb_key_release_event_t*)ev;
 	xcb->base.callbacks.keypress(xcb->base.data, key->detail, 0);
 }
 
-static void x11_handle_configure_notify(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_configure_notify(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_configure_notify_event_t *configure = (xcb_configure_notify_event_t*)ev;
 	xcb->base.callbacks.configure(xcb->base.data, configure->width, configure->height);
 }
 
-static void x11_handle_client_message(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_client_message(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_client_message_event_t *msg = (xcb_client_message_event_t*)ev;
 	if(msg->data.data32[0] == xcb->delete_window && xcb->base.callbacks.close) {
 		xcb->base.callbacks.close(xcb->base.data);
 	}
 }
 
-static void x11_handle_error(xcb_term_display_t *xcb, xcb_generic_error_t *err) {
+static void x11_handle_error(xcb_soda_display_t *xcb, xcb_generic_error_t *err) {
 	xcb_value_error_t *verr = (xcb_value_error_t*)err;
 	log_error("%s(%u) Error:\n\tOpcode: %u.%u\n\tBad Value/ID: %u\n", 
 				 x11_error_code_to_str(verr->error_code), verr->error_code,
@@ -190,7 +190,7 @@ static void x11_handle_error(xcb_term_display_t *xcb, xcb_generic_error_t *err) 
 	UNUSED(xcb);
 }
 
-static void x11_handle_selection_notify(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_selection_notify(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_selection_notify_event_t *selection = (xcb_selection_notify_event_t*)ev;
 	xcb_generic_error_t *err = NULL;
 
@@ -254,7 +254,7 @@ static void x11_handle_selection_notify(xcb_term_display_t *xcb, xcb_generic_eve
 	free(str);
 }
 
-static void x11_handle_motion(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_motion(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_motion_notify_event_t *motion = (xcb_motion_notify_event_t*)ev;
 
 	if(xcb->base.callbacks.pointer_motion) {
@@ -262,7 +262,7 @@ static void x11_handle_motion(xcb_term_display_t *xcb, xcb_generic_event_t *ev) 
 	}
 }
 
-static void x11_handle_button(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_button(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	xcb_button_press_event_t *btn = (xcb_button_press_event_t*)ev;
 	uint32_t pressed = 0;
 	if(btn->response_type == XCB_BUTTON_PRESS) pressed = 1;
@@ -272,7 +272,7 @@ static void x11_handle_button(xcb_term_display_t *xcb, xcb_generic_event_t *ev) 
 	}
 }
 
-static void x11_handle_focus_change(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_focus_change(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	uint32_t focus = 0;
 	if(ev->response_type == XCB_FOCUS_IN) {
 		focus = 1;
@@ -284,7 +284,7 @@ static void x11_handle_focus_change(xcb_term_display_t *xcb, xcb_generic_event_t
 
 }
 
-static void x11_handle_core_event(xcb_term_display_t *xcb, xcb_generic_event_t *ev) {
+static void x11_handle_core_event(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
 	switch(ev->response_type & ~0x80) {
 		case XCB_KEY_PRESS:
 			x11_handle_keypress(xcb, ev);
@@ -320,16 +320,16 @@ static void x11_handle_core_event(xcb_term_display_t *xcb, xcb_generic_event_t *
 	}
 }
 
-static void term_x11_request_clipboard_text(term_display_t *dpy) {
-	xcb_term_display_t *xcb = (xcb_term_display_t*)dpy;
+static void term_x11_request_clipboard_text(soda_display_t *dpy) {
+	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
 
 	xcb_convert_selection(xcb->connection, xcb->window, xcb->selection, xcb->target, xcb->property, XCB_CURRENT_TIME);
 	xcb_flush(xcb->connection);
 }
 
-static void term_x11_display_dispatch(term_display_t *dpy) {
+static void term_x11_display_dispatch(soda_display_t *dpy) {
 	static uint32_t first_call = 1;
-	xcb_term_display_t *xcb = (xcb_term_display_t*)dpy;
+	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
 	xcb_generic_event_t *ev = NULL;
 	if(first_call) {
 		dpy->callbacks.keymap_change(xcb->base.data, xcb->keymap, xcb->state);
@@ -347,8 +347,8 @@ static void term_x11_display_dispatch(term_display_t *dpy) {
 	}
 }
 
-void term_x11_display_deinit(term_display_t *dpy) {
-	xcb_term_display_t *xcb = (xcb_term_display_t*)dpy;
+void term_x11_display_deinit(soda_display_t *dpy) {
+	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
 
 	xkb_state_unref(xcb->state);
 	xkb_keymap_unref(xcb->keymap);
@@ -447,8 +447,45 @@ static int x11_get_atom(xcb_connection_t *c, uint8_t if_exists, const char *name
 	return 0;
 }
 
-term_display_t *term_x11_display_init(void) {
-	xcb_term_display_t *xcb = calloc(1, sizeof(xcb_term_display_t));
+int soda_x11_init_xkb(xcb_connection_t *c, uint16_t major, uint16_t minor, uint8_t *base_event, uint8_t *base_error) {
+	const xcb_query_extension_reply_t *reply;
+	xcb_generic_error_t *error = NULL;
+	xcb_xkb_use_extension_cookie_t cookie;
+	xcb_xkb_use_extension_reply_t *use_reply = NULL;
+
+	reply = xcb_get_extension_data(c, &xcb_xkb_id);
+	if(!reply) {
+		log_error("Failed to query xcb_xkb extensions\n");
+		return -1;
+	}
+
+	if(reply->present == 0) {
+		log_error("xcb_xkb extension error: Extension not present\n");
+		return -1;
+	}
+
+	cookie = xcb_xkb_use_extension(c, 1, 0);
+	use_reply = xcb_xkb_use_extension_reply(c, cookie, &error);
+	if(error) {
+		log_error("xcb_xkb extension error: %s\n", x11_error_code_to_str(error->error_code));
+		free(error);
+		return -1;
+	}
+
+	if(use_reply->supported == 0) {
+		log_error("xcb_xkb extension error: Version %d.%d not supported\n", major, minor);
+		free(use_reply);
+		return -1;
+	}
+
+	if(base_event) *base_event = reply->first_event;
+	if(base_error) *base_error = reply->first_error;
+	free(use_reply);
+	return 0;	
+}
+
+soda_display_t *soda_x11_display_init(void) {
+	xcb_soda_display_t *xcb = calloc(1, sizeof(xcb_soda_display_t));
 	xcb_screen_iterator_t iter;
 	xcb_void_cookie_t cookie;
 	xcb_generic_error_t *err = NULL;
@@ -520,8 +557,9 @@ term_display_t *term_x11_display_init(void) {
 		goto err_xcb_disconnect;
 	}
 
-	int ret = xkb_x11_setup_xkb_extension(xcb->connection, XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION, 0, NULL, NULL, &xcb->xkb_event, &xcb->xkb_error);
-	if(ret == 0) {
+	/*Replace*/
+	int ret = soda_x11_init_xkb(xcb->connection, 1, 0, &xcb->xkb_event, &xcb->xkb_error);
+	if(ret < 0) {
 		log_error("xkb_x11_setup_xkb_extension error\n");
 		goto err_xcb_disconnect;
 	}

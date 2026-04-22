@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <xkbcommon/xkbcommon.h>
 
-typedef struct term_display term_display_t;
+typedef struct soda_display soda_display_t;
 typedef struct {
 	void (*keymap_change)(void *data, struct xkb_keymap *keymap, struct xkb_state *state);
 	void (*pointer_motion)(void *data, int32_t x, int32_t y);
@@ -15,18 +15,18 @@ typedef struct {
 	void (*configure)(void *data, uint32_t width, uint32_t height);
 	void (*clipboard_str_callback)(void *data, const char *str);
 	void (*close)(void *data);
-} term_display_callbacks_t;
+} soda_display_callbacks_t;
 
-struct term_display {
-	int (*attach_shm)(term_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format);
-	void (*dispatch)(term_display_t *display);
-	void (*deinit)(term_display_t *display);
-	void (*request_cliboard_text)(term_display_t *display);
-	term_display_callbacks_t callbacks;
+struct soda_display {
+	int (*attach_shm)(soda_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format);
+	void (*dispatch)(soda_display_t *display);
+	void (*deinit)(soda_display_t *display);
+	void (*request_cliboard_text)(soda_display_t *display);
+	soda_display_callbacks_t callbacks;
 	void *data;
 };
 
-term_display_t *term_wl_display_init(void);
-term_display_t *term_x11_display_init(void);
+soda_display_t *soda_wl_display_init(void);
+soda_display_t *soda_x11_display_init(void);
 
 #endif

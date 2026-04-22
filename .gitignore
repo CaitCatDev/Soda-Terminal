@@ -1,5 +1,5 @@
 .cache
 compile-flags.txt
 xdg-shell-*
-project_terminal
+soda-terminal
 *.o

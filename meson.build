@@ -1,4 +1,4 @@
-project('project-terminal', 'c')
+project('soda-terminal', 'c')
 
 cc = meson.get_compiler('c')
 
@@ -52,4 +52,4 @@ if wayland_client.found()
   srcs += [ './src/wayland.c', xdg_shell_protocol_src, xdg_shell_protocol_header ]
 endif
 
-executable('project-terminal', srcs, include_directories : inc, dependencies: [ wayland_client, xcb, xcb_xkb, xcb_shm, freetype2, fontconfig, xkbcommon, xkbcommon_x11, harfbuzz ])
+executable('soda-terminal', srcs, include_directories : inc, dependencies: [ wayland_client, xcb, xcb_xkb, xcb_shm, freetype2, fontconfig, xkbcommon, xkbcommon_x11, harfbuzz ])

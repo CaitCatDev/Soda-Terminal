@@ -15,8 +15,8 @@
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
 
-#include <term/log.h>
-#include <term/display.h>
+#include <soda-term/log.h>
+#include <soda-term/display.h>
 
 #include <wayland-util.h>
 #include <xkbcommon/xkbcommon.h>
@@ -35,7 +35,7 @@
 #define UNUSED(x) (void)x
 
 typedef struct wl_ctx_s {
-	term_display_t base;
+	soda_display_t base;
 	struct wl_display *display;
 	struct wl_registry *registry;
 
@@ -190,7 +190,7 @@ void wl_keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t s
 	struct itimerspec repeat_rate = { 0 };
 	struct itimerspec nulltimer = { 0 };
 	repeat_rate.it_value.tv_nsec = wl->delay * 1000000;
-	repeat_rate.it_interval.tv_nsec = wl->rate * 1000000;
+	repeat_rate.it_interval.tv_nsec = 1000000000 / wl->rate;
 
 
 	if(wl->base.callbacks.keypress) {
@@ -478,7 +478,7 @@ static const struct wl_buffer_listener wl_buffer_listener = {
 	.release = wl_buffer_release,
 };
 
-int term_wl_display_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format) {
+int term_wl_display_attach_shm(soda_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
 
 	struct wl_shm_pool *pool = wl_shm_create_pool(wl->shm, fd, size);
@@ -503,7 +503,7 @@ int term_wl_display_attach_shm(term_display_t *dpy, int fd, uint32_t width, uint
 	return 0;
 }
 
-void term_wl_display_dispatch(term_display_t *dpy) {
+void term_wl_display_dispatch(soda_display_t *dpy) {
 	wayland_ctx_t *wl = (wayland_ctx_t *)dpy;
 	struct pollfd pfds[2] = { 0 };
 	uint64_t timer_expirations = 0;
@@ -519,7 +519,7 @@ void term_wl_display_dispatch(term_display_t *dpy) {
 		}
 		wl_display_flush(wl->display);
 
-		poll(pfds, 2, 0);
+		poll(pfds, 2, 50);
 		if(pfds[1].revents) {
 			read(wl->timerfd, &timer_expirations, sizeof(timer_expirations));
 			for(uint64_t exp = 0; exp < timer_expirations; exp++) {
@@ -631,7 +631,7 @@ static const struct wl_data_device_listener wl_data_device_listener = {
 	.selection = wl_data_device_selection,
 };
 
-void term_wl_display_request_clipboard(term_display_t *dpy) {
+void term_wl_display_request_clipboard(soda_display_t *dpy) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
 	int pipefd[2];
 
@@ -684,7 +684,7 @@ void term_wl_display_request_clipboard(term_display_t *dpy) {
 	free(buffer);
 }
 
-void term_wl_display_deinit(term_display_t *dpy) {
+void term_wl_display_deinit(soda_display_t *dpy) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
 
 	close(wl->timerfd);
@@ -720,7 +720,7 @@ void term_wl_display_deinit(term_display_t *dpy) {
 	free(wl);
 }
 
-term_display_t *term_wl_display_init(void) {
+soda_display_t *soda_wl_display_init(void) {
 	wayland_ctx_t *wl = calloc(1, sizeof(wayland_ctx_t));
 
 	wl->display = wl_display_connect(NULL);
@@ -799,13 +799,11 @@ term_display_t *term_wl_display_init(void) {
 	wl->data_source = wl_data_device_manager_create_data_source(wl->ddm);
 
 	wl_surface_commit(wl->surface);
-	wl_display_roundtrip(wl->display);
 
 	wl->base.dispatch = term_wl_display_dispatch;
 	wl->base.attach_shm = term_wl_display_attach_shm;
 	wl->base.deinit = term_wl_display_deinit;
 	wl->base.request_cliboard_text = term_wl_display_request_clipboard;
-
 	return &wl->base;
 
 err_free_surface:

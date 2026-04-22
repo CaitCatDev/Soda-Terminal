@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 
-#include <term/log.h>
+#include <soda-term/log.h>
 
 static FILE *log_file;
 static log_level_t log_level;

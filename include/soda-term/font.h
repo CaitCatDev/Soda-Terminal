@@ -17,9 +17,11 @@ typedef struct {
 	uint32_t ascent;
 	uint32_t xadv;
 	uint32_t yadv;
-} term_font_t; 
+	uint32_t feat_count;
+	hb_feature_t features[];
+} soda_font_t;
 
-void term_font_destroy(term_font_t *font);
-term_font_t *term_font_from_name(const char *name, uint32_t px);
+void soda_font_destroy(soda_font_t *font);
+soda_font_t *soda_font_from_name(const char *name, uint32_t px, hb_feature_t *features, uint32_t feature_count);
 
 #endif
