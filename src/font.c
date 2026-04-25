@@ -5,6 +5,7 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_SYNTHESIS_H
 
 #include <hb.h>
 #include <hb-ft.h>
@@ -110,16 +111,23 @@ void soda_glyph_insert(soda_glyph_t **head, soda_glyph_t *new) {
 	}
 }
 
-soda_glyph_t *soda_font_get_glyph(soda_font_t *font, uint32_t glyph_id) {
+soda_glyph_t *soda_font_get_glyph(soda_font_t *font, uint32_t glyph_id, uint8_t bold, uint8_t italic) {
 	soda_glyph_t *glyph = font->cache;
 	for(; glyph; glyph = glyph->next) {
-		if(glyph->glyph_id == glyph_id) {
+		if(glyph->glyph_id == glyph_id && glyph->bold == bold && glyph->italic == italic) {
 			return glyph;
 		}
 	}
 
 	FT_Face face = font->face;
 	FT_Load_Glyph(face, glyph_id, FT_LOAD_DEFAULT);
+	if(bold) {
+		FT_GlyphSlot_Embolden(face->glyph);
+	}
+	if(italic) {
+		FT_GlyphSlot_Oblique(face->glyph);
+	}
+
 	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
 	FT_GlyphSlot ft_glyph = face->glyph;
 
@@ -129,6 +137,8 @@ soda_glyph_t *soda_font_get_glyph(soda_font_t *font, uint32_t glyph_id) {
 	new->height = ft_glyph->bitmap.rows;
 	new->bitmap_top = ft_glyph->bitmap_top;
 	new->bitmap_left = ft_glyph->bitmap_left;
+	new->bold = bold;
+	new->italic = italic;
 	memcpy(new->bitmap, ft_glyph->bitmap.buffer, new->pitch * new->height);
 	new->glyph_id = glyph_id;
 	new->next = NULL;

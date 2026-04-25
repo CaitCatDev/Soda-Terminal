@@ -18,10 +18,12 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
+#include FT_SYNTHESIS_H
 
 #include <hb.h>
 
@@ -184,8 +186,20 @@ static uint32_t alpha_blend(uint32_t cnew, uint32_t cdst, uint8_t alpha) {
 	return MAKE_ARGB(ro, go, bo);
 }
 
+static uint32_t desaturate(uint32_t cnew, uint8_t intensity) {
+	uint8_t rn = (cnew >> 16) & 0xff;
+	uint8_t gn = (cnew >> 8) & 0xff;
+	uint8_t bn = (cnew) & 0xff;
+
+	uint8_t ro = (rn * intensity) >> 8;
+	uint8_t go = (gn * intensity) >> 8;
+	uint8_t bo = (bn * intensity) >> 8;
+
+	return MAKE_ARGB(ro, go, bo);
+}
+
 static void render_glyph(soda_shm_buffer_t *buffer, soda_font_t *font, uint32_t glyph_index, int32_t x, int32_t y, uint32_t fg) {
-	soda_glyph_t *glyph = soda_font_get_glyph(font, glyph_index);
+	soda_glyph_t *glyph = soda_font_get_glyph(font, glyph_index, 0, 0);
 
 
 	for(uint32_t cy = 0; cy < glyph->height; cy++) {
@@ -204,26 +218,59 @@ static void render_char(soda_shm_buffer_t *buffer, soda_font_t *font, uint32_t u
 }
 
 static void render_term_cell(soda_shm_buffer_t *buffer, soda_font_t *font, uint32_t glyph_index, uint32_t x, uint32_t y, vt_cell_t *cell) {
-	soda_glyph_t *glyph = soda_font_get_glyph(font, glyph_index);
+	uint8_t bold = cell->attributes & TERM_CELL_ATTRIBUTE_BOLD;
+	uint8_t italic = cell->attributes & TERM_CELL_ATTRIBUTE_ITALIC;
+	soda_glyph_t *glyph = soda_font_get_glyph(font, glyph_index, bold, italic);
 
 	uint32_t rows = glyph->height;
 	uint32_t width = glyph->width;
 	uint32_t pitch = glyph->pitch;
 	uint8_t *bitmap = glyph->bitmap;
 	uint32_t *data = buffer->data;
+	uint32_t fg = cell->attributes & TERM_CELL_ATTRIBUTE_INVERSE ? cell->bg : cell->fg;
+	uint32_t bg = cell->attributes & TERM_CELL_ATTRIBUTE_INVERSE ? cell->fg : cell->bg;
+
 	for(uint32_t cy = 0; cy < font->yadv; cy++) {
 		for(uint32_t cx = 0; cx < font->xadv; cx++) {
-			data[(y + cy) * buffer->width + (x + cx)] = cell->bg;
+			data[(y + cy) * buffer->width + (x + cx)] = bg;
 		}
+	}
+
+	if(cell->attributes & TERM_CELL_ATTRIBUTE_INVIS) {
+		return;
+	}
+
+	if(cell->attributes & TERM_CELL_ATTRIBUTE_FAINT) {
+		fg = desaturate(fg, 0x80);
 	}
 
 	for(uint32_t cy = 0; cy < rows; cy++) {
 		for(uint32_t cx = 0; cx < width; cx++) {
 			uint8_t alpha = bitmap[cy * pitch + cx];
-			uint32_t px = alpha_blend(cell->fg, cell->bg, alpha);
+			uint32_t px = alpha_blend(fg, bg, alpha);
 			data[(y + cy + font->ascent - glyph->bitmap_top) * buffer->width + (x + cx + glyph->bitmap_left)] = px;
 		}
 	}
+
+	if(cell->attributes & (TERM_CELL_ATTRIBUTE_CROSSED_OUT)) {
+		for(uint32_t cx = 0; cx < font->xadv; cx++) {
+			data[(y + (font->yadv >> 1)) * buffer->width + (x + cx)] = fg;
+		}
+	}
+
+	if(cell->attributes & (TERM_CELL_ATTRIBUTE_UNDERLINE | TERM_CELL_ATTRIBUTE_DBL_UNDERLINE)) {
+		for(uint32_t cx = 0; cx < font->xadv; cx++) {
+			data[(y + font->ascent) * buffer->width + (x + cx)] = fg;
+		}
+	}
+
+	if(cell->attributes & (TERM_CELL_ATTRIBUTE_DBL_UNDERLINE)) {
+		for(uint32_t cx = 0; cx < font->xadv; cx++) {
+			data[(y + font->ascent + 3) * buffer->width + (x + cx)] = fg;
+		}
+	}
+
+
 }
 
 static int render_term_text_hb(vt_ctx_t *ctx, soda_font_t *font, soda_shm_buffer_t *buffer) {

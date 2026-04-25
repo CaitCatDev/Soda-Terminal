@@ -15,6 +15,8 @@ typedef struct soda_glyph soda_glyph_t;
 struct soda_glyph {
 	soda_glyph_t *next;
 	uint32_t glyph_id;
+	uint8_t italic;
+	uint8_t bold;
 	uint32_t width;
 	uint32_t height;
 	uint32_t pitch;
@@ -38,6 +40,6 @@ typedef struct {
 
 void soda_font_destroy(soda_font_t *font);
 soda_font_t *soda_font_from_name(const char *name, uint32_t px, hb_feature_t *features, uint32_t feature_count);
-soda_glyph_t *soda_font_get_glyph(soda_font_t *font, uint32_t glyph_id);
+soda_glyph_t *soda_font_get_glyph(soda_font_t *font, uint32_t glyph_id, uint8_t bold, uint8_t italic);
 
 #endif
