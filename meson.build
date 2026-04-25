@@ -13,6 +13,7 @@ wayland_client = dependency('wayland-client', required: get_option('enable-wl'))
 xcb = dependency('xcb', required: get_option('enable-x11'))
 xcb_shm = dependency('xcb-shm', required: get_option('enable-x11'))
 xcb_xkb = dependency('xcb-xkb', required: get_option('enable-x11'))
+xcb_present = dependency('xcb-present', required: get_option('enable-x11'))
 freetype2 = dependency('freetype2')
 harfbuzz = dependency('harfbuzz')
 fontconfig = dependency('fontconfig')
@@ -52,4 +53,4 @@ if wayland_client.found()
   srcs += [ './src/wayland.c', xdg_shell_protocol_src, xdg_shell_protocol_header ]
 endif
 
-executable('soda-terminal', srcs, include_directories : inc, dependencies: [ wayland_client, xcb, xcb_xkb, xcb_shm, freetype2, fontconfig, xkbcommon, xkbcommon_x11, harfbuzz ])
+executable('soda-terminal', srcs, include_directories : inc, dependencies: [ wayland_client, xcb, xcb_xkb, xcb_shm, xcb_present, freetype2, fontconfig, xkbcommon, xkbcommon_x11, harfbuzz ])

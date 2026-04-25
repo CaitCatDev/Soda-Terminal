@@ -18,9 +18,12 @@
 #include <soda-term/vt.h>
 #include <soda-term/log.h>
 
+#define VT_BUFFER_LEN 512
+
 void vt_setcursor_pos(vt_ctx_t *term, int32_t x, int32_t y) {
 	if(term->term_mode & TERM_MODE_ORIGIN) {
 		y += term->top;
+		if(y < term->top) y = term->top;
 		if(y >= term->bottom) y = term->bottom;
 	} else {
 		if(y < 0) y = 0;
@@ -35,9 +38,9 @@ void vt_setcursor_pos(vt_ctx_t *term, int32_t x, int32_t y) {
 }
 
 void vt_decquery_mode(vt_ctx_t *term, uint32_t mode) {
-	char buffer[64] = { 0 };
+	char buffer[CSI_BUFFER_LEN] = { 0 };
 	log_debug("DECRQM unknown mode: %d\n", mode);
-	snprintf(buffer, 64, "\x1b[?%d;%d$y", mode, 0);
+	snprintf(buffer, CSI_BUFFER_LEN, "\x1b[?%d;%d$y", mode, 0);
 	write(term->ptmx, buffer, strlen(buffer));
 }
 
@@ -55,12 +58,13 @@ void vt_decsetmode(vt_ctx_t *term, uint32_t mode) {
 		case TERM_DECMODE_REVERSE_VIDEO_MODE:
 			term->term_mode |= TERM_MODE_REVERSE_VIDEO;
 			for(int32_t r = 0; r < term->max_rows; ++r) {
+				term->screen[r].dirty = true;
 				for(int32_t c = 0; c < term->max_cols; ++c) {
-					if(term->screen[r][c].fg == term->def_fg) {
-						term->screen[r][c].bg = term->def_fg;
+					if(term->screen[r].cells[c].fg == term->def_fg) {
+						term->screen[r].cells[c].bg = term->def_fg;
 					}
-					if(term->screen[r][c].bg == term->def_bg) {
-						term->screen[r][c].fg = term->def_bg;
+					if(term->screen[r].cells[c].bg == term->def_bg) {
+						term->screen[r].cells[c].fg = term->def_bg;
 					}
 					term->fg = term->def_bg;
 					term->bg = term->def_fg;
@@ -96,6 +100,10 @@ void vt_decsetmode(vt_ctx_t *term, uint32_t mode) {
 			break;
 		case TERM_DECMODE_ALTSCREEN:
 			term->term_mode |= TERM_MODE_ALT_SCREEN;
+			term->screen = term->alt;
+			for(int32_t r = 0; r < term->max_rows; r++) {
+				term->alt[r].dirty = true;
+			}
 			break;
 		case TERM_DECMODE_BRACKETED_PASTE:
 			term->term_mode |= TERM_MODE_BRACKTED_PASTE;
@@ -126,12 +134,13 @@ void vt_decresetmode(vt_ctx_t *term, uint32_t mode) {
 		case TERM_DECMODE_REVERSE_VIDEO_MODE:
 			term->term_mode &= ~TERM_MODE_REVERSE_VIDEO;
 			for(int32_t r = 0; r < term->max_rows; ++r) {
+				term->screen[r].dirty = 1;
 				for(int32_t c = 0; c < term->max_cols; ++c) {
-					if(term->screen[r][c].fg == term->def_bg) {
-						term->screen[r][c].fg = term->def_fg;
+					if(term->screen[r].cells[c].fg == term->def_bg) {
+						term->screen[r].cells[c].fg = term->def_fg;
 					}
-					if(term->screen[r][c].bg == term->def_fg) {
-						term->screen[r][c].bg = term->def_bg;
+					if(term->screen[r].cells[c].bg == term->def_fg) {
+						term->screen[r].cells[c].bg = term->def_bg;
 					}
 				}
 			}
@@ -167,6 +176,11 @@ void vt_decresetmode(vt_ctx_t *term, uint32_t mode) {
 			break;
 		case TERM_DECMODE_ALTSCREEN:
 			term->term_mode &= ~TERM_MODE_ALT_SCREEN;
+			term->screen = term->primary;
+			for(int32_t r = 0; r < term->max_rows; r++) {
+				term->primary[r].dirty = true;
+			}
+
 			break;
 		case TERM_DECMODE_BRACKETED_PASTE:
 			term->term_mode &= ~TERM_MODE_BRACKTED_PASTE;
@@ -215,200 +229,218 @@ uint32_t utf8_to_utf32(const uint8_t *utf8) {
 	} else if((utf8[0] & 0xf8) == 0xf0) {
 		return (((uint32_t)(utf8[0] & 0x07) << 18) | ((uint32_t)(utf8[1] & 0x3f) << 12) | ((uint32_t)(utf8[2] & 0x3f) << 6) | ((uint32_t)utf8[3] & 0x3f));
 	}
+
+	log_debug("Bad UTF sequence: %x\n", utf8[0]);
 	return 0;
 }
 
-uint32_t vt_read_utf32(vt_ctx_t *vt) {
-	int fd = vt->ptmx;
-	uint8_t b1 = 0;
-	uint8_t extbytes[5] = { 0 };
+void vt_process_chars(vt_ctx_t *vt, uint8_t *utf8, uint32_t len) {
+	uint8_t byte = 0;
+	uint32_t i = 0;
+	uint32_t utf32 = 0;
+	uint8_t overflow[5] = { 0 };
 	const char *graphics_charset[] = {
-										" ", "♦", "▒", "␉", "␌", "␍",
-										"␊", "°", "±", "␤", "␋", "┘",
-										"┐", "┌", "└", "┼", "⎺", "⎻", "─",
-										"⎼", "⎽", "├", "┤", "┴", "┬", "│",
-										"≤", "≥", "π", "≠", "£", "·"
+		" ", "♦", "▒", "␉", "␌", "␍",
+		"␊", "°", "±", "␤", "␋", "┘",
+		"┐", "┌", "└", "┼", "⎺", "⎻", "─",
+		"⎼", "⎽", "├", "┤", "┴", "┬", "│",
+		"≤", "≥", "π", "≠", "£", "·"
 	};
 
-	read(fd, &b1, 1);
+	while(i < len) {
+		if(CTRL_CODE(utf8[i])) {
+			vt_handle_ctrl_code(vt, utf8[i]);
+			i++;
+			continue;
+		}
+		int utf8_len = utf8_get_length(utf8[i]);
 
-	if(IN_RANGE(b1, '_', '~') && vt->charset) {
-		return utf8_to_utf32((uint8_t*)graphics_charset[b1 - '_']);
-	}
+		if(IN_RANGE(utf8[i], '_', '~') && vt->charset && vt->state == TERM_STATE_GROUND) {
+			utf32 = utf8_to_utf32((uint8_t*)graphics_charset[utf8[i] - '_']);
+			i++;
+		} else if(i + utf8_len > len) {
+			memcpy(overflow, &utf8[i], len - i);
+			read(vt->ptmx, &overflow[len-i], i + utf8_len - len);
+			utf32 = utf8_to_utf32(overflow);
+			i+=utf8_len;
+		} else {
+			utf32 = utf8_to_utf32(&utf8[i]);
+			i+=utf8_len;
+		}
 
-	if(CTRL_CODE(b1)) {
-		return b1;
-	}
+		if(vt->state == TERM_STATE_ESC_START && vt->term_mode & TERM_MODE_VT52) {
+			vt52_escape_process(vt, utf32, utf8[i+0], utf8[i+1]);
+			vt->state = TERM_STATE_GROUND;
+			if(utf32 == 'Y') {
+				i+=2;
+			}
+			continue;
+		}
 
-	uint32_t len = utf8_get_length(b1);
-	if(len == 0) {
-		log_warn("Invalid UTF-8 sequence returning as CTRL char %x\n", b1);
-		return b1;
-	}
-
-	extbytes[0] = b1;
-	read(fd, &extbytes[1], len - 1);
-	return utf8_to_utf32(extbytes);
-}
-
-void vt_process_char(vt_ctx_t *vt, utf32_t c) {
-	uint8_t byte = 0;
-	if(CTRL_CODE(c)) {
-		vt_handle_ctrl_code(vt, c);
-		return;
-	}
-
-	if(vt->state == TERM_STATE_ESC_START && vt->term_mode & TERM_MODE_VT52) {
-		vt52_escape_process(vt, c);
-		vt->state = TERM_STATE_GROUND;
-		return;
-	}
-
-	switch (vt->state) {
-		case TERM_STATE_ESC_START:
-			switch(c) {
-				case '[':
-					vt->state = TERM_STATE_CSI_SEQUENCE;
-					break;
-				case '(':
-					read(vt->ptmx, &byte, 1);
-					break;
-				case '=':
-					vt->state = TERM_STATE_GROUND;
-					vt->term_mode |= TERM_MODE_APP_KEYPAD;
-					break;
-				case 'P':
-					vt->state = TERM_STATE_DCS_SEQUENCE;
-					break;
-				case 'E':
-					vt_scroll(vt);
-					vt->cursor_pos.x = 0;
-					vt->state = TERM_STATE_GROUND;
-					break;
-				case 'D':
-					vt->cursor_pos.y++;;
-					if(vt->cursor_pos.y >= vt->max_rows) {
-						for(int32_t i = 1; i < vt->max_rows; i++) {
-							memcpy(vt->screen[i-1], vt->screen[i], vt->max_cols * sizeof(vt_cell_t));
-						}
-						vt->cursor_pos.y = vt->max_rows - 1;
-						for(int32_t i = 0; i < vt->max_cols; i++) {
-							vt->screen[vt->cursor_pos.y][i].utf32 = ' ';
-						}
-					}
-					vt->state = TERM_STATE_GROUND;
-					break;
-				case 'M':
-					vt->cursor_pos.y--;
-					if(vt->cursor_pos.y < 0) {
-						for(int32_t i = vt->max_rows - 1; i > 0; i--) {
-							memcpy(vt->screen[i], vt->screen[i-1], vt->max_cols * sizeof(vt_cell_t));
-						}
-						vt->cursor_pos.y = 0;
-						for(int32_t i = 0; i < vt->max_cols; i++) {
-							vt->screen[0][i].utf32 = ' ';
-						}
-					}
-					vt->state = TERM_STATE_GROUND;
-				break;
-				case '#':
-					read(vt->ptmx, &byte, 1);
-					if(byte == '8') {
-						for(int32_t y = 0; y < vt->max_rows; y++) {
-							for(int32_t x = 0; x < vt->max_cols; x++) {
-								vt->screen[y][x].utf32 = 'E';
+		switch (vt->state) {
+			case TERM_STATE_ESC_START:
+				switch(utf32) {
+					case '[':
+						vt->state = TERM_STATE_CSI_SEQUENCE;
+						break;
+					case '(':
+						vt->state = TERM_STATE_SET_G0_CSET;
+						break;
+					case '=':
+						vt->state = TERM_STATE_GROUND;
+						vt->term_mode |= TERM_MODE_APP_KEYPAD;
+						break;
+					case 'P':
+						vt->state = TERM_STATE_DCS_SEQUENCE;
+						break;
+					case 'H':
+						vt->tabstops[vt->cursor_pos.x >> 5] |= (1 << (vt->cursor_pos.x & 31));
+						break;
+					case 'E':
+						vt_scroll(vt);
+						vt->cursor_pos.x = 0;
+						vt->state = TERM_STATE_GROUND;
+						break;
+					case 'D':
+						vt->cursor_pos.y++;;
+						if(vt->cursor_pos.y >= vt->max_rows) {
+							for(int32_t i = 1; i < vt->max_rows; i++) {
+								memcpy(vt->screen[i-1].cells, vt->screen[i].cells, vt->max_cols * sizeof(vt_cell_t));
+								vt->screen[i-1].dirty = true;
+							}
+							vt->cursor_pos.y = vt->max_rows - 1;
+							for(int32_t i = 0; i < vt->max_cols; i++) {
+								vt->screen[vt->cursor_pos.y].cells[i].utf32 = ' ';
 							}
 						}
-					} else {
-						log_debug("\\x1b#%c\n", byte);
-					}
-					vt->state = TERM_STATE_GROUND;
+						vt->state = TERM_STATE_GROUND;
+						break;
+					case 'M':
+						vt->cursor_pos.y--;
+						if(vt->cursor_pos.y < 0) {
+							for(int32_t i = vt->max_rows - 1; i > 0; i--) {
+								memcpy(vt->screen[i].cells, vt->screen[i-1].cells, vt->max_cols * sizeof(vt_cell_t));
+								vt->screen[i].dirty = true;
+							}
+							vt->cursor_pos.y = 0;
+							for(int32_t i = 0; i < vt->max_cols; i++) {
+								vt->screen[0].cells[i].utf32 = ' ';
+							}
+						}
+						vt->state = TERM_STATE_GROUND;
 					break;
-				case '%':
-					read(vt->ptmx, &byte, 1);
-					log_debug("\\x1b%%%c\n", byte);
-					vt->state = TERM_STATE_GROUND;
-					break;
-				case '>':
-					vt->state = TERM_STATE_GROUND;
-					vt->term_mode &= ~TERM_MODE_APP_KEYPAD;
-					break;
-				default:
-					log_warn("Unhandled escape %c(%x)\n", c, c);
-					vt->state = 0;
-					break;
-			}
-			break;
-		case TERM_STATE_DCS_SEQUENCE: {
-			uint32_t i = 2;
-			memset(vt->strescape_buffer, 0, 4096);
-			read(vt->ptmx, vt->strescape_buffer, 2);
-			while(vt->strescape_buffer[i - 2] != '\x1b' && vt->strescape_buffer[i - 1] != '\\') {
-				read(vt->ptmx, &vt->strescape_buffer[i], 1);
-				if(vt->strescape_buffer[i] == '\a') break;
-				i++;
-				if(i >= DCS_BUFFER_LEN - 1) break;
-			}
-			log_debug("%s\n", vt->strescape_buffer);
-			vt->state = TERM_STATE_GROUND;
-			break;
-		}
-		case TERM_STATE_CSI_SEQUENCE:
-			vt->csi_buffer[vt->csi_len] = c;
-			vt->csi_len++;
-			if(IN_RANGE(vt->csi_buffer[vt->csi_len-1], 0x40, 0x7f)) {
-				vt_csi_exec(vt, (char*)vt->csi_buffer, vt->csi_len);
-				vt->state = 0;	
-				if(vt->csi_len >= CSI_BUFFER_LEN - 1) break;
-			}
-			break;
-		case TERM_STATE_GROUND:
-		default:
-			if(vt->cursor_pos.x >= vt->max_cols || vt->flags & TERM_FLAGS_NEED_WRAP) {
-				if(vt->term_mode & TERM_MODE_WRAPAROUND) {
-					vt_scroll(vt);
+					case '#':
+						byte = utf8[i];
+						i++;
+						if(byte == '8') {
+							for(int32_t y = 0; y < vt->max_rows; y++) {
+								for(int32_t x = 0; x < vt->max_cols; x++) {
+									vt->screen[y].cells[x].utf32 = 'E';
+								}
+							}
+						} else {
+							log_debug("\\x1b#%c\n", byte);
+						}
+						vt->state = TERM_STATE_GROUND;
+						break;
+					case '%':
+						byte = utf8[i];
+						i++;
+						log_debug("\\x1b%%%c\n", byte);
+						vt->state = TERM_STATE_GROUND;
+						break;
+					case '>':
+						vt->state = TERM_STATE_GROUND;
+						vt->term_mode &= ~TERM_MODE_APP_KEYPAD;
+						break;
+					default:
+						log_warn("Unhandled escape %c(%x)\n", utf32, utf32);
+						vt->state = 0;
+						break;
 				}
-				vt->cursor_pos.x = 0;
-				vt->flags &= ~(TERM_FLAGS_NEED_WRAP);
+				break;
+			case TERM_STATE_SET_G0_CSET: {
+				if(utf32 == 'B') {
+					vt->charset = 0;
+				} else if(utf32 == '0') {
+					vt->charset = 1;
+				}
+				vt->state = TERM_STATE_GROUND;
+				break;
 			}
-			vt->screen[vt->cursor_pos.y][vt->cursor_pos.x].utf32 = c;
-			vt->screen[vt->cursor_pos.y][vt->cursor_pos.x].fg = vt->fg;
-			vt->screen[vt->cursor_pos.y][vt->cursor_pos.x].bg = vt->bg;
-			vt->screen[vt->cursor_pos.y][vt->cursor_pos.x].attributes = vt->attributes;
-			vt->last_char = c;
-			vt->cursor_pos.x++;
-			if(vt->cursor_pos.x == vt->max_cols) {
-				vt->cursor_pos.x = vt->max_cols - 1;
-				vt->flags |= TERM_FLAGS_NEED_WRAP;
+			case TERM_STATE_DCS_SEQUENCE: {
+				uint32_t j = 2;
+				vt->strescape_buffer[j - 2] = utf8[i];
+				vt->strescape_buffer[j - 1] = utf8[i+1];
+				i+=2;
+				while(vt->strescape_buffer[j - 2] != '\x1b' && vt->strescape_buffer[j - 1] != '\\') {
+					vt->strescape_buffer[j] = utf8[i];
+					i++;
+					if(vt->strescape_buffer[j] == '\a') break;
+					j++;
+					if(j >= DCS_BUFFER_LEN - 1) break;
+				}
+				log_debug("%s\n", vt->strescape_buffer);
+				vt->state = TERM_STATE_GROUND;
+				break;
 			}
-			break;
+			case TERM_STATE_CSI_SEQUENCE:
+				vt->csi_buffer[vt->csi_len] = utf32;
+				vt->csi_len++;
+				if(IN_RANGE(vt->csi_buffer[vt->csi_len-1], 0x40, 0x7f)) {
+					vt_csi_exec(vt, (char*)vt->csi_buffer, vt->csi_len);
+					vt->state = 0;
+				}
+				break;
+			case TERM_STATE_GROUND:
+			default:
+				if(vt->cursor_pos.x >= vt->max_cols || vt->flags & TERM_FLAGS_NEED_WRAP) {
+					if(vt->term_mode & TERM_MODE_WRAPAROUND) {
+						vt_scroll(vt);
+					}
+					vt->cursor_pos.x = 0;
+					vt->flags &= ~(TERM_FLAGS_NEED_WRAP);
+				}
+
+				vt->screen[vt->cursor_pos.y].cells[vt->cursor_pos.x].utf32 = utf32;
+				vt->screen[vt->cursor_pos.y].cells[vt->cursor_pos.x].fg = vt->fg;
+				vt->screen[vt->cursor_pos.y].cells[vt->cursor_pos.x].bg = vt->bg;
+				vt->screen[vt->cursor_pos.y].cells[vt->cursor_pos.x].attributes = vt->attributes;
+				vt->screen[vt->cursor_pos.y].dirty = 1;
+				vt->last_char = utf32;
+				vt->cursor_pos.x++;
+				if(vt->cursor_pos.x == vt->max_cols) {
+					vt->cursor_pos.x = vt->max_cols - 1;
+					vt->flags |= TERM_FLAGS_NEED_WRAP;
+				}
+				break;
+		}
 	}
 }
 
 int vt_event(vt_ctx_t *vt) {
 	struct pollfd pfd = { vt->ptmx, POLLIN, 0 };
-	uint32_t c = 0;
-	while(poll(&pfd, 1, 0)) {
-		if(pfd.revents & POLLHUP || pfd.revents & POLLERR) {
-			log_error("poll: %s\n", strerror(errno));
-			return -1;
-		} else if(pfd.revents & POLLIN) {
-			c = vt_read_utf32(vt);
-			vt_process_char(vt, c);
-		}
-	}
+	uint32_t len = 0;
+	uint8_t buffer[VT_BUFFER_LEN] = { 0 };
 
+	while(poll(&pfd, 1, 0)) {
+		len = read(vt->ptmx, buffer, VT_BUFFER_LEN);
+		vt_process_chars(vt, buffer, len);
+		memset(buffer, 0, len);
+	}
 	return 0;
+
 }
 
 void vt_clear_screen(vt_ctx_t *term) {
 	for(int32_t y = 0; y < term->max_rows; y++) {
 		for(int32_t x = 0; x < term->max_cols; x++) {
-			term->screen[y][x].utf32 = ' ';
-			term->screen[y][x].attributes = 0;
-			term->screen[y][x].fg = term->fg;
-			term->screen[y][x].bg = term->bg;
+			term->screen[y].cells[x].utf32 = ' ';
+			term->screen[y].cells[x].attributes = 0;
+			term->screen[y].cells[x].fg = term->fg;
+			term->screen[y].cells[x].bg = term->bg;
 		}
+		term->screen[y].dirty = 1;
 	}
 }
 
@@ -441,7 +473,7 @@ void vt_clear_line(vt_ctx_t *term, uint32_t mode) {
 	}
 
 	for(; c < max_c; c++) {
-		term->screen[term->cursor_pos.y][c].utf32 = ' ';
+		term->screen[term->cursor_pos.y].cells[c].utf32 = ' ';
 	}
 }
 
@@ -838,29 +870,38 @@ void vt_csi_exec(vt_ctx_t *term, const char *csi, uint32_t len) {
 			break;
 		default:
 			switch(mode) {
+				case 'g':
+					if(parameters[0] == 0) {
+						term->tabstops[term->cursor_pos.x >> 5] &= ~(1 << (term->cursor_pos.x & 31));
+					} else if (parameters[0] == 3) {
+						memset(term->tabstops, 0, ((term->max_cols >> 5) + ((term->max_cols & 31) ? 1 : 0))*sizeof(uint32_t));
+					} else {
+						goto unknown_csi;
+					}
+					break;
 				case 'f':
 				case 'H':
 					parameters[0] = MAX(1, parameters[0]);
 					parameters[1] = MAX(1, parameters[1]);
-						vt_setcursor_pos(term, parameters[1]-1, (parameters[0]-1));
+					vt_setcursor_pos(term, parameters[1]-1, (parameters[0]-1));
 					break;
 				case 'J':
 					switch (parameters[0]) {
 						case 0:
 							for(int32_t r = term->cursor_pos.y; r < term->max_rows; r++) {
 								for(int32_t c = r == term->cursor_pos.y ? term->cursor_pos.x : 0; c < term->max_cols; c++) {
-									term->screen[r][c].utf32 = ' ';
-									term->screen[r][c].bg = term->bg;
-									term->screen[r][c].fg = term->fg;
+									term->screen[r].cells[c].utf32 = ' ';
+									term->screen[r].cells[c].bg = term->bg;
+									term->screen[r].cells[c].fg = term->fg;
 								}
 							}
 							break;
 						case 1:
 							for(int32_t r = term->cursor_pos.y + 1; r > 0; r--) {
 								for(int32_t c = (r - 1) == term->cursor_pos.y ? term->cursor_pos.x + 1 : term->max_cols; c > 0; c--) {
-									term->screen[r-1][c-1].utf32 = ' ';
-									term->screen[r-1][c-1].bg = term->bg;
-									term->screen[r-1][c-1].fg = term->fg;
+									term->screen[r-1].cells[c-1].utf32 = ' ';
+									term->screen[r-1].cells[c-1].bg = term->bg;
+									term->screen[r-1].cells[c-1].fg = term->fg;
 								}
 							}
 							break;
@@ -917,13 +958,13 @@ void vt_csi_exec(vt_ctx_t *term, const char *csi, uint32_t len) {
 				case 'X':
 					if(parameters[0] == 0) parameters[0]++;
 					for(uint32_t k = term->cursor_pos.x; k < term->cursor_pos.x + parameters[0]; ++k) {
-						term->screen[term->cursor_pos.y][k].utf32 = ' ';
+						term->screen[term->cursor_pos.y].cells[k].utf32 = ' ';
 					}
 					break;
 				case 'b':
 					if(parameters[0] == 0) parameters[0]++;
 					for(uint32_t k = 0; k < parameters[0]; ++k) {
-						term->screen[term->cursor_pos.y][term->cursor_pos.x + k].utf32 = term->last_char;
+						term->screen[term->cursor_pos.y].cells[term->cursor_pos.x + k].utf32 = term->last_char;
 					}
 					vt_setcursor_pos(term, term->cursor_pos.x + parameters[0], term->cursor_pos.y);
 					break;
@@ -970,10 +1011,7 @@ unknown_csi:
 	log_printf_raw(TERM_LOG_LEVEL_DEBUG, "]\n");
 }
 
-void vt52_escape_process(vt_ctx_t *vt, uint8_t escape) {
-	uint8_t posx = 0;
-	uint8_t posy = 0;
-
+void vt52_escape_process(vt_ctx_t *vt, uint8_t escape, uint8_t y, uint8_t x) {
 
 	switch(escape) {
 		case '<':
@@ -1010,30 +1048,28 @@ void vt52_escape_process(vt_ctx_t *vt, uint8_t escape) {
 			vt->cursor_pos.y--;
 			if(vt->cursor_pos.y < 0) {
 				for(int32_t i = vt->max_rows - 1; i > 0; i--) {
-					memcpy(vt->screen[i], vt->screen[i-1], vt->max_cols * sizeof(vt_cell_t));
+					memcpy(vt->screen[i].cells, vt->screen[i-1].cells, vt->max_cols * sizeof(vt_cell_t));
 				}
 				vt->cursor_pos.y = 0;
 				for(int32_t i = 0; i < vt->max_cols; i++) {
-					vt->screen[0][i].utf32 = ' ';
+					vt->screen[0].cells[i].utf32 = ' ';
 				}
 			}
 			break;
 		case 'J':
 			for(int32_t r = vt->cursor_pos.y; r < vt->max_rows; ++r) {
 				for(int32_t c = r == vt->cursor_pos.y ? vt->cursor_pos.x : 0; c < vt->max_cols; ++c) {
-					vt->screen[r][c].utf32 = ' ';
+					vt->screen[r].cells[c].utf32 = ' ';
 				}
 			}
 			break;
 		case 'K':
 			for(int32_t x = vt->cursor_pos.x; x < vt->max_cols; ++x) {
-				vt->screen[vt->cursor_pos.y][x].utf32 = ' ';
+				vt->screen[vt->cursor_pos.y].cells[x].utf32 = ' ';
 			}
 			break;
 		case 'Y':
-			read(vt->ptmx, &posy, 1);
-			read(vt->ptmx, &posx, 1);
-			vt_setcursor_pos(vt, posx-32, posy-32);
+			vt_setcursor_pos(vt, x-32, y-32);
 			break;
 		case 'Z':
 			write(vt->ptmx, "\x1b/Z", strlen("\x1b/Z"));
@@ -1042,104 +1078,15 @@ void vt52_escape_process(vt_ctx_t *vt, uint8_t escape) {
 			log_debug("Unknown VT52 escape sequence \\x1b%c\n", escape);
 	}
 }
-/*
-void vt_escape_process(term_ctx_t *term) {
-	char escape = 0;
-
-	if(term->mode & TERM_MODE_VT52) {
-		vt52_escape_process(term);
-		return;
-	}
-
-	read(term->ptmx, &escape, 1);
-	log_debug("\\x1b%c\n", escape);
-	switch(escape) {
-		case '[':
-			vt_csi_handle(term);
-			break;
-		case ']':
-		case 'P':
-		case 'k':
-			vt_strescape_handle(term, escape);
-			break;
-		case '=':
-			term->mode |= TERM_MODE_APP_KEYPAD;
-			break;
-		case '>':
-			term->mode &= ~(TERM_MODE_APP_KEYPAD);
-			break;
-		case 'E':
-			vt_setcursor_pos(term, 0, term->row+1);
-			break;
-		case 'D':
-			term->row++;
-			if(term->row >= term->max_rows) {
-				for(int32_t i = 1; i < term->max_rows; i++) {
-					memcpy(term->screen[i-1], term->screen[i], term->max_cols * sizeof(term_cell_t));
-				}
-				term->row = term->max_rows - 1;
-				for(int32_t i = 0; i < term->max_cols; i++) {
-					term->screen[term->row][i].utf32 = ' ';
-				}
-			}
-			break;
-		case 'M':
-			term->row--;
-			if(term->row < 0) {
-				for(int32_t i = term->max_rows - 1; i > 0; i--) {
-					memcpy(term->screen[i], term->screen[i-1], term->max_cols * sizeof(term_cell_t));
-				}
-				term->row = 0;
-				for(int32_t i = 0; i < term->max_cols; i++) {
-					term->screen[0][i].utf32 = ' ';
-				}
-			}
-		break;
-		case '#':
-			read(term->ptmx, &escape, 1);
-			if(escape == '8') {
-				for(int32_t y = 0; y < term->max_rows; y++) {
-					for(int32_t x = 0; x < term->max_cols; x++) {
-						term->screen[y][x].utf32 = 'E';
-					}
-				}
-			} else {
-				log_debug("\\x1b#%c\n", escape);
-			}
-			break;
-		case '%':
-			read(term->ptmx, &escape, 1);
-			log_debug("\\x1b%%%c\n", escape);
-			break;
-		case '(':
-			read(term->ptmx, &escape, 1);
-			if(escape == '0') {
-				term->graphics_set = true;
-			} else if (escape == 'B') {
-				term->graphics_set = false;
-			} else {
-				term->graphics_set = false;
-				log_debug("Unknown charset: \\x1b(%c\n returning to regular charset", escape);
-			}
-			break;
-		default:
-			log_debug("Unknown Escape format \\x1b%c\n", escape);
-			break;
-	}
-	return;
-}
-*/
-
-
 
 void vt_scroll(vt_ctx_t *term) {
 	if(term->cursor_pos.y >= term->bottom) {
 		for(int32_t i = term->top+1; i <= term->bottom; i++) {
-			memcpy(term->screen[i-1], term->screen[i], term->max_cols * sizeof(vt_cell_t));
+			memcpy(term->screen[i-1].cells, term->screen[i].cells, term->max_cols * sizeof(vt_cell_t));
 		}
 		term->cursor_pos.y = term->bottom;
 		for(int32_t i = 0; i < term->max_cols; i++) {
-			term->screen[term->cursor_pos.y][i].utf32 = ' ';
+			term->screen[term->cursor_pos.y].cells[i].utf32 = ' ';
 		}
 		term->cursor_pos.x = 0;
 	} else {
@@ -1149,16 +1096,20 @@ void vt_scroll(vt_ctx_t *term) {
 }
 
 void vt_handle_ctrl_code(vt_ctx_t *term, uint32_t code) {
+	uint32_t i = 0, j = 0;
+	uint32_t tabstop_size = (term->max_cols >> 5) + ((term->max_cols % 32) ? 1 : 0);
 	switch(code) {
 		case '\t':
-			for(int32_t i = 0; i < 8 - (term->cursor_pos.x % 8); ++i) {
-				if(term->cursor_pos.x + i >= term->max_cols) {
-					break;
+			for(i = term->cursor_pos.x >> 5; i < tabstop_size; ++i) {
+				for(j = (((uint32_t)term->cursor_pos.x >> 5) == i) ? ((term->cursor_pos.x) & 31) + 1 : 0; j < 32; j++) {
+					if(term->tabstops[i] & (1 << j)) {
+						term->cursor_pos.x = j + (i<<5);
+						if(term->cursor_pos.x >= term->max_cols) term->cursor_pos.x = term->max_cols - 1;
+						return;
+					}
 				}
-				term->screen[term->cursor_pos.y][term->cursor_pos.x + i].utf32 = ' ';
 			}
-			term->cursor_pos.x += 8 - (term->cursor_pos.x % 8);
-			if(term->cursor_pos.x >= term->max_cols) term->cursor_pos.x = term->max_cols - 1;
+			term->cursor_pos.x = term->max_cols - 1;
 			break;
 		case '\a':
 			break;
@@ -1184,20 +1135,20 @@ void vt_handle_ctrl_code(vt_ctx_t *term, uint32_t code) {
 	}
 }
 
-void vt_free_screen(vt_cell_t **scr, int32_t rows) {
+void vt_free_screen(vt_line_t *scr, int32_t rows) {
 	for(int32_t r = 0; r < rows; r++) {
-		free(scr[r]);
+		free(scr[r].cells);
 	}
 	free(scr);
 }
 
-vt_cell_t **vt_allocate_screen(int32_t rows, int32_t cols) {
-	vt_cell_t **new = malloc(rows * sizeof(vt_cell_t*));
+vt_line_t *vt_allocate_screen(int32_t rows, int32_t cols) {
+	vt_line_t *new = malloc(rows * sizeof(vt_line_t));
 	if(new == NULL) return NULL;
 
 	for(int32_t r = 0; r < rows; r++) {
-		new[r] = malloc(cols * sizeof(vt_cell_t));
-		if(new[r] == NULL) {
+		new[r].cells = malloc(cols * sizeof(vt_cell_t));
+		if(new[r].cells == NULL) {
 			vt_free_screen(new, r);
 			return NULL;
 		}
@@ -1268,7 +1219,7 @@ static void vt_child_exec_shell(const struct passwd *pw, char *shell, int fd) {
 	setenv("USER", pw->pw_name, 1);
 	setenv("SHELL", shell, 1);
 	setenv("HOME", pw->pw_dir, 1);
-	setenv("TERM", "project-term", 1);
+	setenv("TERM", "soda-term", 1);
 
 	char *args[2] = { shell, NULL };
 
@@ -1347,7 +1298,8 @@ int vt_forkshell(int parent, int child, pid_t *pout) {
 void vt_deinit(vt_ctx_t *vt) {
 	vt_free_screen(vt->primary, vt->max_rows);
 	vt_free_screen(vt->alt, vt->max_rows);
-	
+	free(vt->tabstops);
+
 	close(vt->ptmx);
 	free(vt);
 }
@@ -1369,7 +1321,11 @@ vt_ctx_t *vt_init(uint32_t fg, uint32_t bg) {
 	vt->fg = fg;
 	vt->bg = bg;
 
+	uint32_t size = (vt->max_cols >> 5) + (vt->max_cols & 31 ? 1 : 0);
 	vt->term_mode |= TERM_MODE_WRAPAROUND | TERM_MODE_SHOW_CURSOR;
+	uint32_t *tabstops = calloc(size, sizeof(uint32_t));
+	memset(tabstops, 0x80, size * sizeof(uint32_t));
+	vt->tabstops = tabstops;
 
 	vt->primary = vt_allocate_screen(vt->max_rows, vt->max_cols);
 	vt->alt = vt_allocate_screen(vt->max_rows, vt->max_cols);

@@ -7,6 +7,7 @@
 #include <xcb/xproto.h>
 #include <xcb/xkb.h>
 #include <xcb/shm.h>
+#include <xcb/present.h>
 
 #include <fcntl.h>
 #include <termios.h>
@@ -34,12 +35,21 @@ struct xid_free_list {
 	xid_free_list_t *next;
 };
 
+typedef struct soda_buffer_list soda_buffer_list_t;
+
+struct soda_buffer_list {
+	uint32_t pixmap_id;
+	soda_shm_buffer_t *buffer;
+	soda_buffer_list_t *next;
+};
+
 typedef struct x11_soda_display {
 	soda_display_t base;
 	xcb_connection_t *connection;
 	const xcb_setup_t *setup;
 	xcb_screen_t *screen;
 	xid_free_list_t *free_list;
+	soda_buffer_list_t *buffer_list;
 
 	struct xkb_context *ctx;
 	struct xkb_keymap *keymap;
@@ -48,8 +58,15 @@ typedef struct x11_soda_display {
 	uint8_t shm_major;
 	uint8_t shm_event;
 	uint8_t shm_error;
+
 	uint8_t xkb_event;
 	uint8_t xkb_error;
+
+	uint8_t present_event;
+	uint8_t present_error;
+	xcb_present_event_t eid;
+	int presenting;
+	int redraw_callback;
 
 
 	xcb_atom_t wm_protocols;
@@ -65,6 +82,7 @@ typedef struct x11_soda_display {
 
 	xcb_window_t window;
 	xcb_gcontext_t gc;
+	uint64_t last_msc;
 } xcb_soda_display_t;
 
 static const char *x11_error_code_to_str(uint8_t code) {
@@ -123,28 +141,50 @@ static int xid_free(xcb_soda_display_t *xcb, uint32_t id) {
 	return 0;
 }
 
-static int term_x11_attach_shm(soda_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format) {
+static int term_x11_attach_shm(soda_display_t *dpy, soda_shm_buffer_t *buffer) {
 	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
-	int dupfd = dup(fd);/*X closes the FD So dup it*/
+	int dupfd = dup(buffer->fd);/*X closes the FD So dup it*/
 
 	xcb_shm_seg_t shmseg = get_xid(xcb);
 	xcb_shm_attach_fd(xcb->connection, shmseg, dupfd, 0);
 
 	xcb_pixmap_t pixmap = get_xid(xcb);
-	xcb_shm_create_pixmap(xcb->connection, pixmap, xcb->window, width, height, 32, shmseg, offset);
+	xcb_shm_create_pixmap(xcb->connection, pixmap, xcb->window, buffer->width, buffer->height, xcb->bpp, shmseg, 0);
 
 	xcb_shm_detach(xcb->connection, shmseg);
 	xid_free(xcb, shmseg);
 
-	xcb_copy_area(xcb->connection, pixmap, xcb->window, xcb->gc, 0, 0, 0, 0, width, height);
-	xcb_free_pixmap(xcb->connection, pixmap);
-	xid_free(xcb, pixmap);
-	xcb_flush(xcb->connection);
+	xcb_present_pixmap(xcb->connection, xcb->window, pixmap, 0, 0, 0, 0, 0, 0, 0, 0, XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL);
 
+	buffer->in_use = true;
+	xcb->presenting = 1;
+
+	soda_buffer_list_t *new = calloc(1, sizeof(soda_buffer_list_t));
+	new->pixmap_id = pixmap;
+	new->buffer = buffer;
+	if(xcb->buffer_list == NULL) {
+		xcb->buffer_list = new;
+	} else {
+		new->next = xcb->buffer_list;
+		xcb->buffer_list = new;
+	}
+
+	xcb_flush(xcb->connection);
 	return 0;
-	UNUSED(stride);
-	UNUSED(format);
-	UNUSED(size);
+}
+
+static int term_x11_get_fd(soda_display_t *dpy, int **fds) {
+	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
+	if(!fds) return -1;
+
+	*fds = calloc(1, sizeof(int));
+	if(*fds == NULL) {
+		return -1;
+	}
+
+	(*fds)[0] = xcb_get_file_descriptor(xcb->connection);
+
+	return 1;
 }
 
 static void x11_handle_xkb_event(xcb_soda_display_t *xcb, xcb_generic_event_t *ev) {
@@ -156,6 +196,66 @@ static void x11_handle_xkb_event(xcb_soda_display_t *xcb, xcb_generic_event_t *e
 			break;
 		default:
 			log_debug("Unhandled XKB Event: %d\n", xkb_ev->xkbType);
+			break;
+	}
+}
+
+soda_buffer_list_t *buffer_remove_by_pixmap_id(soda_buffer_list_t **h, xcb_pixmap_t pixmap) {
+	soda_buffer_list_t *tmp = *h;
+	if(tmp == NULL) return NULL;
+	if(tmp->pixmap_id == pixmap) {
+		*h = tmp->next;
+		return tmp;
+	}
+
+	soda_buffer_list_t *prev = tmp;
+	tmp = tmp->next;
+	for(; tmp; tmp = tmp->next) {
+		if(tmp->pixmap_id) {
+			prev->next = tmp->next;
+			return tmp;
+		}
+		prev = tmp;
+	}
+
+	return NULL;
+}
+
+static void x11_handle_present_idle_notify(xcb_soda_display_t *xcb, xcb_ge_generic_event_t *ev) {
+	xcb_present_idle_notify_event_t *idle = (xcb_present_idle_notify_event_t*)ev;
+	soda_buffer_list_t *tmp;
+
+	tmp = buffer_remove_by_pixmap_id(&xcb->buffer_list, idle->pixmap);
+	if(tmp == NULL) {
+		log_debug("Pixmap %d has no buffer in the pending buffer list\n", idle->pixmap);
+		exit(1);
+	}
+	tmp->buffer->buffer_freed(tmp->buffer);
+	free(tmp);
+
+	xcb_free_pixmap(xcb->connection, idle->pixmap);
+	xcb_flush(xcb->connection);
+	xid_free(xcb, idle->pixmap);
+}
+
+
+
+static void x11_handle_xcb_present_event(xcb_soda_display_t *xcb, xcb_ge_generic_event_t *ev) {
+	xcb_present_generic_event_t *gev = (xcb_present_generic_event_t*)ev;
+
+	switch(gev->evtype) {
+		case XCB_PRESENT_EVENT_COMPLETE_NOTIFY: {
+			xcb->presenting = 0;
+			xcb->last_msc = ((xcb_present_complete_notify_event_t*)gev)->msc;
+			if(xcb->redraw_callback && xcb->base.callbacks.redraw) {
+				xcb->redraw_callback = 0;
+				xcb->presenting = 1;
+				xcb->base.callbacks.redraw(xcb->base.data);
+			}
+			break;
+																						}
+		case XCB_PRESENT_EVENT_IDLE_NOTIFY:
+			x11_handle_present_idle_notify(xcb, ev);
 			break;
 	}
 }
@@ -327,6 +427,16 @@ static void term_x11_request_clipboard_text(soda_display_t *dpy) {
 	xcb_flush(xcb->connection);
 }
 
+static void term_x11_request_redraw_callback(soda_display_t *dpy) {
+	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
+	xcb->redraw_callback = 1;
+	if(xcb->presenting == 0 && xcb->base.callbacks.redraw) {
+		xcb->presenting = 1;
+		xcb->redraw_callback = 0;
+		xcb->base.callbacks.redraw(xcb->base.data);
+	}
+}
+
 static void term_x11_display_dispatch(soda_display_t *dpy) {
 	static uint32_t first_call = 1;
 	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
@@ -335,20 +445,31 @@ static void term_x11_display_dispatch(soda_display_t *dpy) {
 		dpy->callbacks.keymap_change(xcb->base.data, xcb->keymap, xcb->state);
 		first_call = 0;
 	}
+	xcb_flush(xcb->connection);
 
 	while((ev = xcb_poll_for_event(xcb->connection))) {
 		uint8_t type = ev->response_type & ~0x80;
 		if(type == xcb->xkb_event) {
 			x11_handle_xkb_event(xcb, ev);
+		} else if(type == XCB_GE_GENERIC) {
+			xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t*)ev;
+			if(ge->extension == xcb->present_event) {
+				x11_handle_xcb_present_event(xcb, ge);
+			}
 		} else {
 			x11_handle_core_event(xcb, ev);
 		}
 		free(ev);
 	}
+	xcb_flush(xcb->connection);
 }
 
 void term_x11_display_deinit(soda_display_t *dpy) {
 	xcb_soda_display_t *xcb = (xcb_soda_display_t*)dpy;
+
+	while(xcb->buffer_list) {
+		xcb->base.dispatch(dpy);
+	}
 
 	xkb_state_unref(xcb->state);
 	xkb_keymap_unref(xcb->keymap);
@@ -473,7 +594,7 @@ int soda_x11_init_xkb(xcb_connection_t *c, uint16_t major, uint16_t minor, uint8
 	}
 
 	if(use_reply->supported == 0) {
-		log_error("xcb_xkb extension error: Version %d.%d not supported\n", major, minor);
+		log_error("xcb_xkb extension error: Version %d.%d not supported Server version %d.%d\n", major, minor, use_reply->serverMajor, use_reply->serverMinor);
 		free(use_reply);
 		return -1;
 	}
@@ -557,7 +678,6 @@ soda_display_t *soda_x11_display_init(void) {
 		goto err_xcb_disconnect;
 	}
 
-	/*Replace*/
 	int ret = soda_x11_init_xkb(xcb->connection, 1, 0, &xcb->xkb_event, &xcb->xkb_error);
 	if(ret < 0) {
 		log_error("xkb_x11_setup_xkb_extension error\n");
@@ -579,6 +699,23 @@ soda_display_t *soda_x11_display_init(void) {
 												XCB_XKB_EVENT_TYPE_STATE_NOTIFY;
 
 	xcb_xkb_select_events_aux(xcb->connection, XCB_XKB_ID_USE_CORE_KBD, xkb_events, 0, xkb_events, 0, 0, NULL);
+
+	const xcb_query_extension_reply_t *present = xcb_get_extension_data(xcb->connection, &xcb_present_id);
+	if(present == NULL || present->present == 0) {
+		log_error("xcb_get_extension_data: unable to get present extension\n");
+		goto err_xcb_disconnect;
+	}
+	xcb->present_event = present->major_opcode;
+	xcb->eid = xcb_generate_id(xcb->connection);
+
+	cookie = xcb_present_select_input_checked(xcb->connection, xcb->eid, xcb->window, XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY | XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY | XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+	err = xcb_request_check(xcb->connection, cookie);
+	if(err) {
+		log_error("Failed to select present events\n");
+		free(err);
+		goto err_xcb_disconnect;
+	}
+
 	if(x11_get_atom(xcb->connection, true, X11_ATOM_WM_PROTOCOLS_NAME, &xcb->wm_protocols) == -1) {
 		log_error("get_atom %s error\n", X11_ATOM_WM_PROTOCOLS_NAME);
 		goto err_xcb_disconnect;
@@ -615,7 +752,9 @@ soda_display_t *soda_x11_display_init(void) {
 	xcb->base.attach_shm = term_x11_attach_shm;
 	xcb->base.dispatch = term_x11_display_dispatch;
 	xcb->base.deinit = term_x11_display_deinit;
+	xcb->base.display_fds = term_x11_get_fd;
 	xcb->base.request_cliboard_text = term_x11_request_clipboard_text;
+	xcb->base.request_frame_callback = term_x11_request_redraw_callback;
 	return &xcb->base;
 
 err_xcb_disconnect:

@@ -14,6 +14,7 @@ typedef uint32_t utf32_t;
 #define TERM_STATE_CSI_SEQUENCE 2
 #define TERM_STATE_DCS_SEQUENCE 3
 #define TERM_STATE_OCS_SEQEUNCE 4
+#define TERM_STATE_SET_G0_CSET 6
 
 /*VT 100 doesn't wrap when input is inserted
  * the last column of a line. That only sets
@@ -33,6 +34,7 @@ typedef uint32_t utf32_t;
 #define TERM_CELL_ATTRIBUTE_INVIS (1 << 8)
 #define TERM_CELL_ATTRIBUTE_CROSSED_OUT (1 << 9)
 #define TERM_CELL_ATTRIBUTE_DBL_UNDERLINE (1 << 10)
+#define TERM_CELL_ATTRIBUTE_DIRTY (1 << 11)
 
 #define TERM_MODE_BRACKTED_PASTE (1 << 0)
 #define TERM_MODE_APP_KEYPAD (1 << 1)
@@ -97,6 +99,11 @@ typedef struct {
 	int32_t y;
 } vt_cursor_t;
 
+typedef struct vt_line {
+	uint32_t dirty;
+	vt_cell_t *cells;
+} vt_line_t;
+
 typedef struct vt_ctx_s {
 	int ptmx;
 	pid_t child;
@@ -116,9 +123,10 @@ typedef struct vt_ctx_s {
 	int32_t top;
 	int32_t bottom;
 
-	vt_cell_t **primary;
-	vt_cell_t **alt;
-	vt_cell_t **screen;
+	uint32_t *tabstops;
+	vt_line_t *primary;
+	vt_line_t *alt;
+	vt_line_t *screen;
 	vt_cell_t cursor;
 	utf32_t last_char;
 
@@ -134,11 +142,11 @@ typedef struct vt_ctx_s {
 	uint32_t pointer_mode;
 } vt_ctx_t;
 
-void vt52_escape_process(vt_ctx_t *vt, uint8_t escape);
+void vt52_escape_process(vt_ctx_t *vt, uint8_t escape, uint8_t y, uint8_t x);
 void vt_csi_exec(vt_ctx_t *term, const char *csi, uint32_t len);
-void vt_free_screen(vt_cell_t **scr, int32_t rows);
+void vt_free_screen(vt_line_t *scr, int32_t rows);
 void vt_setcursor_shape(vt_ctx_t *term, uint32_t shape);
-vt_cell_t **vt_allocate_screen(int32_t rows, int32_t cols);
+vt_line_t *vt_allocate_screen(int32_t rows, int32_t cols);
 void vt_scroll(vt_ctx_t *vt);
 void vt_handle_ctrl_code(vt_ctx_t *vt, uint32_t code);
 vt_ctx_t *vt_init(uint32_t fg, uint32_t bg);

@@ -81,11 +81,60 @@ __error_config:
 void soda_font_destroy(soda_font_t *font) {
 	if(!font) return;
 
+	/*TODO: Cache Management*/
+	soda_glyph_t *tmp = font->cache;
+	soda_glyph_t *next = NULL;
+	for(; tmp; tmp = next) {
+		next = tmp->next;
+		free(tmp);
+	}
+
 	hb_font_destroy(font->hb_font);
 
 	FT_Done_Face(font->face);
 	FT_Done_FreeType(font->library);
 	free(font);
+}
+
+void soda_glyph_insert(soda_glyph_t **head, soda_glyph_t *new) {
+	if(*head == NULL) {
+		*head = new;
+		return;
+	}
+
+	for(soda_glyph_t *tmp = *head; tmp; tmp = tmp->next) {
+		if(tmp->next == NULL) {
+			tmp->next = new;
+			return;
+		}
+	}
+}
+
+soda_glyph_t *soda_font_get_glyph(soda_font_t *font, uint32_t glyph_id) {
+	soda_glyph_t *glyph = font->cache;
+	for(; glyph; glyph = glyph->next) {
+		if(glyph->glyph_id == glyph_id) {
+			return glyph;
+		}
+	}
+
+	FT_Face face = font->face;
+	FT_Load_Glyph(face, glyph_id, FT_LOAD_DEFAULT);
+	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
+	FT_GlyphSlot ft_glyph = face->glyph;
+
+	soda_glyph_t *new = malloc(sizeof(soda_glyph_t) + ft_glyph->bitmap.rows * ft_glyph->bitmap.pitch);
+	new->pitch = ft_glyph->bitmap.pitch;
+	new->width = ft_glyph->bitmap.width;
+	new->height = ft_glyph->bitmap.rows;
+	new->bitmap_top = ft_glyph->bitmap_top;
+	new->bitmap_left = ft_glyph->bitmap_left;
+	memcpy(new->bitmap, ft_glyph->bitmap.buffer, new->pitch * new->height);
+	new->glyph_id = glyph_id;
+	new->next = NULL;
+	soda_glyph_insert(&font->cache, new);
+
+	return new;
 }
 
 soda_font_t *soda_font_from_name(const char *name, uint32_t px, hb_feature_t *features, uint32_t feature_count) {

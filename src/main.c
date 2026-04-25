@@ -37,11 +37,14 @@
 #define TERM_BRACKTED_PASTE_START_STR "\x1b[200~"
 #define TERM_BRACKTED_PASTE_END_STR "\x1b[201~"
 
+
 typedef struct soda_ctx {
 	int running;
 	int dirty;
 
+
 	vt_ctx_t *vt;
+	soda_shm_buffer_t *buffer;
 
 	struct xkb_keymap *keymap;
 	struct xkb_state *state;
@@ -54,14 +57,6 @@ typedef struct soda_ctx {
 	int32_t x, y;
 	uint32_t button_state;
 } soda_ctx_t;
-
-typedef struct soda_shm_buffer {
-	int32_t width, height;
-	int32_t stride, size;
-	uint32_t format;
-	void *data;
-	int fd;
-} soda_shm_buffer_t;
 
 int allocate_shm_file(int32_t size) {
 	char template[] = "/xxxx-sdvt-shm";
@@ -93,6 +88,26 @@ int allocate_shm_file(int32_t size) {
 	return fd;
 }
 
+void soda_buffer_deinit(soda_shm_buffer_t *buffer) {
+	if(!(buffer->fd < 0)) {
+		close(buffer->fd);
+	}
+
+	if(buffer->data) {
+		munmap(buffer->data, buffer->size);
+	}
+	free(buffer);
+}
+
+void soda_shm_buffer_freed(void *buffer) {
+	soda_shm_buffer_t *shm = buffer;
+
+	shm->in_use = false;
+	if(shm->free_after_use) {
+		soda_buffer_deinit(buffer);
+	}
+}
+
 soda_shm_buffer_t *soda_buffer_init(int32_t width, int32_t height, int32_t stride, int32_t size, uint32_t format) {
 	soda_shm_buffer_t *buffer = calloc(1, sizeof(soda_shm_buffer_t));
 	int fd = 0;
@@ -114,6 +129,7 @@ soda_shm_buffer_t *soda_buffer_init(int32_t width, int32_t height, int32_t strid
 	buffer->width = width;
 	buffer->height = height;
 	buffer->data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	buffer->buffer_freed = soda_shm_buffer_freed;
 	if(buffer->data == MAP_FAILED) {
 		close(fd);
 		free(buffer);
@@ -123,26 +139,14 @@ soda_shm_buffer_t *soda_buffer_init(int32_t width, int32_t height, int32_t strid
 	return buffer;
 }
 
-void soda_buffer_deinit(soda_shm_buffer_t *buffer) {
-	if(!(buffer->fd < 0)) {
-		close(buffer->fd);
-	}
-
-	if(buffer->data) {
-		munmap(buffer->data, buffer->size);
-	}
-	free(buffer);
-}
-
-void put_pixel(soda_shm_buffer_t *buffer, int32_t x, int32_t y, uint32_t px) {
+static inline void put_pixel(soda_shm_buffer_t *buffer, int32_t x, int32_t y, uint32_t px) {
 	uint32_t *data = (uint32_t*)buffer->data;
 	int32_t w = buffer->width;
-	int32_t h = buffer->height;
 
-	if(y <= 0 || x <= 0) {
+	if(y < 0 || y >= buffer->height) {
 		return;
 	}
-	if(y >= h || x >= w) {
+	if(x < 0 || x >= buffer->width) {
 		return;
 	}
 
@@ -164,7 +168,7 @@ uint32_t get_pixel(soda_shm_buffer_t *buffer, int32_t x, int32_t y) {
 	return data[y * w + x];
 }
 
-static uint32_t alpha_blend(uint32_t cnew, uint32_t cdst, float alpha) {
+static uint32_t alpha_blend(uint32_t cnew, uint32_t cdst, uint8_t alpha) {
 	uint8_t rn = (cnew >> 16) & 0xff;
 	uint8_t gn = (cnew >> 8) & 0xff;
 	uint8_t bn = (cnew) & 0xff;
@@ -173,26 +177,23 @@ static uint32_t alpha_blend(uint32_t cnew, uint32_t cdst, float alpha) {
 	uint8_t gd = (cdst >> 8) & 0xff;
 	uint8_t bd = (cdst) & 0xff;
 
-	uint8_t ro = rn * alpha + rd * (1.0f-alpha);
-	uint8_t go = gn * alpha + gd * (1.0f-alpha);
-	uint8_t bo = bn * alpha + bd * (1.0f-alpha);
+	uint8_t ro = (alpha * (rn - rd) + (rd << 8)) >> 8;
+	uint8_t go = (alpha * (gn - gd) + (gd << 8)) >> 8;
+	uint8_t bo = (alpha * (bn - bd) + (bd << 8)) >> 8;
 
 	return MAKE_ARGB(ro, go, bo);
 }
 
 static void render_glyph(soda_shm_buffer_t *buffer, soda_font_t *font, uint32_t glyph_index, int32_t x, int32_t y, uint32_t fg) {
+	soda_glyph_t *glyph = soda_font_get_glyph(font, glyph_index);
 
-	FT_Face face = font->face;
-	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
-	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
-	FT_GlyphSlot glyph = face->glyph;
 
-	for(uint32_t cy = 0; cy < glyph->bitmap.rows; cy++) {
-		for(uint32_t cx = 0; cx < glyph->bitmap.width; cx++) {
-			float alpha = (float)glyph->bitmap.buffer[cy * glyph->bitmap.pitch + cx] / 255.0f;
+	for(uint32_t cy = 0; cy < glyph->height; cy++) {
+		for(uint32_t cx = 0; cx < glyph->width; cx++) {
+			uint8_t alpha = glyph->bitmap[cy * glyph->pitch + cx];
 			uint32_t px = get_pixel(buffer, x + cx + glyph->bitmap_left, y + font->ascent + cy - glyph->bitmap_top);
 			px = alpha_blend(fg, px, alpha);
-			put_pixel(buffer, x + cx + glyph->bitmap_left, font->ascent + y + cy - glyph->bitmap_top, px);
+			put_pixel(buffer, x + cx, font->ascent + y + cy - glyph->bitmap_top, px);
 		}
 	}
 }
@@ -203,89 +204,87 @@ static void render_char(soda_shm_buffer_t *buffer, soda_font_t *font, uint32_t u
 }
 
 static void render_term_cell(soda_shm_buffer_t *buffer, soda_font_t *font, uint32_t glyph_index, uint32_t x, uint32_t y, vt_cell_t *cell) {
-	FT_Face face = font->face;
-	FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
-	if(cell->attributes == TERM_CELL_ATTRIBUTE_BOLD && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
-		FT_Outline_Embolden(&face->glyph->outline, 1 * 64);
-	}
-	FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
-	FT_GlyphSlot glyph = face->glyph;
-	if(glyph->bitmap.rows == 0 || face->glyph->bitmap.width == 0) {
-		/*Skip rendering glyphs that don't have any image*/
-		return;
+	soda_glyph_t *glyph = soda_font_get_glyph(font, glyph_index);
+
+	uint32_t rows = glyph->height;
+	uint32_t width = glyph->width;
+	uint32_t pitch = glyph->pitch;
+	uint8_t *bitmap = glyph->bitmap;
+	uint32_t *data = buffer->data;
+	for(uint32_t cy = 0; cy < font->yadv; cy++) {
+		for(uint32_t cx = 0; cx < font->xadv; cx++) {
+			data[(y + cy) * buffer->width + (x + cx)] = cell->bg;
+		}
 	}
 
-
-	for(uint32_t cy = 0; cy < glyph->bitmap.rows; cy++) {
-		for(uint32_t cx = 0; cx < glyph->bitmap.width; cx++) {
-			float alpha = (float)glyph->bitmap.buffer[cy * glyph->bitmap.pitch + cx] / 255.0f;
+	for(uint32_t cy = 0; cy < rows; cy++) {
+		for(uint32_t cx = 0; cx < width; cx++) {
+			uint8_t alpha = bitmap[cy * pitch + cx];
 			uint32_t px = alpha_blend(cell->fg, cell->bg, alpha);
-			put_pixel(buffer, x + cx + glyph->bitmap_left, font->ascent + y + cy - glyph->bitmap_top, px);
+			data[(y + cy + font->ascent - glyph->bitmap_top) * buffer->width + (x + cx + glyph->bitmap_left)] = px;
 		}
 	}
 }
 
 static int render_term_text_hb(vt_ctx_t *ctx, soda_font_t *font, soda_shm_buffer_t *buffer) {
-	for(int32_t i = 0; i < ctx->max_rows; i++) {
-		hb_buffer_t *buf = hb_buffer_create();
+	int32_t max_cols = ctx->max_cols;
+	int32_t max_rows = ctx->max_rows;
+
+	hb_buffer_t *buf = hb_buffer_create();
+	for(int32_t i = 0; i < max_rows; i++) {
+		hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
+		hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
+		hb_buffer_set_language(buf, hb_language_from_string("en", -1));
+		vt_line_t line = ctx->screen[i];
+		if(line.dirty == 0) {
+			break;
+		}
+		line.dirty = 0;
 		if(hb_buffer_allocation_successful(buf) == false) {
 			log_error("hb_buffer_create failed: %s\n", strerror(errno));
 			return -1;
 		}
-		for(int32_t x = 0; x < ctx->max_cols; x++) {
-			if(ctx->screen[i][x].utf32 == 0) break;
-			hb_buffer_add_utf32(buf, &ctx->screen[i][x].utf32, 1, 0, -1);
-			for(uint32_t cy = 0; cy < font->yadv; cy++) {
-				for(uint32_t cx = 0; cx < font->xadv; cx++) {
-					put_pixel(buffer, x * font->xadv + cx, font->yadv * i + cy, ctx->screen[i][x].bg);
-				}
-			}
+		for(int32_t x = 0; x < max_cols; x++) {
+			hb_buffer_add_utf32(buf, &line.cells[x].utf32, 1, 0, -1);
 		}
-		hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
-		hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
-		hb_buffer_set_language(buf, hb_language_from_string("en", -1));
 
 		hb_shape(font->hb_font, buf, font->features, 1);
 		unsigned int glyph_count = 0;
 		hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, &glyph_count);
 		for(uint32_t j = 0; j < glyph_count; j++) {
 			hb_codepoint_t glyphid = glyph_info[j].codepoint;
-			render_term_cell(buffer, font, glyphid, j * font->xadv, font->yadv * i, &ctx->screen[i][j]);
+			render_term_cell(buffer, font, glyphid, j * font->xadv, font->yadv * i, &line.cells[j]);
 		}
-		hb_buffer_destroy(buf);
+		hb_buffer_reset(buf);
 	}
-
+	hb_buffer_destroy(buf);
 	return 0;
 }
 
 static int render_term_text_ft(vt_ctx_t *ctx, soda_font_t *font, soda_shm_buffer_t *buffer) {
 	for(int32_t y = 0; y < ctx->max_rows; ++y) {
 		for(int32_t x = 0; x < ctx->max_cols; ++x) {
-			if(ctx->screen[y][x].utf32) {
-				uint32_t gi = FT_Get_Char_Index(font->face, ctx->screen[y][x].utf32);
-				render_term_cell(buffer, font, gi, font->xadv * x, y * font->yadv, &ctx->screen[y][x]);
+			if((ctx->screen[y].cells[x].attributes & TERM_CELL_ATTRIBUTE_DIRTY) == 0) {
+				continue;
 			}
+			for(uint32_t cy = 0; cy < font->yadv; cy++) {
+				for(uint32_t cx = 0; cx < font->xadv; cx++) {
+					put_pixel(buffer, x * font->xadv + cx, font->yadv * y + cy, ctx->screen[y].cells[x].bg);
+				}
+			}
+
+			if(ctx->screen[y].cells[x].utf32) {
+				uint32_t gi = FT_Get_Char_Index(font->face, ctx->screen[y].cells[x].utf32);
+				render_term_cell(buffer, font, gi, font->xadv * x, y * font->yadv, &ctx->screen[y].cells[x]);
+			}
+			ctx->screen[y].cells[x].attributes &= ~TERM_CELL_ATTRIBUTE_DIRTY;
 		}
 	}
 	return 0;
 }
 
-static soda_shm_buffer_t *draw_frame(soda_ctx_t *ctx) {
-	int32_t width = ctx->width;
-	int32_t height = ctx->height;
-	int32_t stride = width * sizeof(uint32_t);
-	int32_t size = stride * height;
-	soda_shm_buffer_t *buffer = soda_buffer_init(width, height, stride, size, 0);
-	uint32_t *data = buffer->data;
-	uint32_t bg = ctx->vt->term_mode & TERM_MODE_REVERSE_VIDEO ? ctx->vt->def_fg : ctx->vt->def_bg;
+int draw_frame(soda_ctx_t *ctx, soda_shm_buffer_t *buffer) {
 	uint32_t fg = ctx->vt->term_mode & TERM_MODE_REVERSE_VIDEO ? ctx->vt->def_bg : ctx->vt->def_fg;
-
-
-	for(int32_t y = 0; y < height; ++y) {
-		for(int32_t x = 0; x < width; ++x) {
-			data[y * width + x] = bg;
-		}
-	}
 
 	if(ctx->no_harfbuzz) {
 		render_term_text_ft(ctx->vt, ctx->font, buffer);
@@ -297,7 +296,7 @@ static soda_shm_buffer_t *draw_frame(soda_ctx_t *ctx) {
 		render_char(buffer, ctx->font, ctx->vt->cursor.utf32, ctx->font->xadv * ctx->vt->cursor_pos.x, ctx->vt->cursor_pos.y * ctx->font->yadv, fg);
 	}
 
-	return buffer;
+	return 0;
 }
 
 static void send_arrow_key(vt_ctx_t *term, char c) {
@@ -392,40 +391,61 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	vt_ctx_t *vt = ctx->vt;
 	ctx->width = width;
 	ctx->height = height;
-	int32_t rows = ctx->height / ctx->font->yadv;
+	int32_t rows = (ctx->height-1) / ctx->font->yadv;
 	int32_t cols = ctx->width / ctx->font->xadv;
-	if(rows != vt->max_rows || cols != vt->max_cols) {
-		vt_cell_t **new_primary = vt_allocate_screen(rows, cols);
-		vt_cell_t **new_alt = vt_allocate_screen(rows, cols);
-		for(int32_t r = 0; r < rows; ++r) {
-			for(int32_t c = 0; c < cols; ++c) {
-				new_primary[r][c].utf32 = ' ';
-				new_primary[r][c].fg = vt->fg;
-				new_primary[r][c].bg = vt->bg;
-				new_primary[r][c].attributes = 0;
-				new_alt[r][c].utf32 = ' ';
-				new_alt[r][c].fg = vt->fg;
-				new_alt[r][c].bg = vt->bg;
-				new_alt[r][c].attributes = 0;
+	uint32_t tabstop_size = (cols >> 5) + ((cols & 31) ? 1 : 0);
+
+	if(cols != vt->max_cols) {
+			uint32_t *tabstops = calloc(tabstop_size, sizeof(uint32_t));
+			memset(tabstops, 0x80, tabstop_size * sizeof(uint32_t));
+			free(vt->tabstops);
+			vt->tabstops = tabstops;
+			for(int32_t r = 0; r < vt->max_rows; r++) {
+			void *tmp = realloc(vt->primary[r].cells, sizeof(vt_cell_t) * cols);
+			void *tmp2 = realloc(vt->alt[r].cells, sizeof(vt_cell_t) * cols);
+			vt->primary[r].cells = tmp;
+			vt->alt[r].cells = tmp2;
+			for(int32_t c = vt->max_cols; c < cols; c++) {
+				vt->primary[r].cells[c].utf32 = ' ';
+				vt->primary[r].cells[c].fg = vt->fg;
+				vt->primary[r].cells[c].bg = vt->bg;
+				vt->primary[r].cells[c].attributes = 0;
+				vt->alt[r].cells[c].utf32 = ' ';
+				vt->alt[r].cells[c].fg = vt->fg;
+				vt->alt[r].cells[c].bg = vt->bg;
+				vt->alt[r].cells[c].attributes = 0;
 			}
 		}
-		for(int32_t r = 0; r < MIN(vt->max_rows, rows); r++) {
-				memcpy(new_primary[r], vt->primary[r], MIN(cols, vt->max_cols) * sizeof(vt_cell_t));
-				memcpy(new_alt[r], vt->alt[r], MIN(cols, vt->max_cols) * sizeof(vt_cell_t));
-		}
-		if(vt->screen == vt->alt) {
-			vt->screen = new_alt;
-		} else {
-			vt->screen = new_primary;
-		}
-		vt_free_screen(vt->primary, vt->max_rows);
-		vt_free_screen(vt->alt, vt->max_rows);
-		vt->primary = new_primary;
-		vt->alt = new_alt;
 		vt->max_cols = cols;
+	}
+
+
+	if(rows != vt->max_rows) {
+		for(int32_t r = rows; r < vt->max_rows; r++) {
+			free(vt->primary[r].cells);
+			free(vt->alt[r].cells);
+		}
+		void *tmp = realloc(vt->primary, sizeof(vt_line_t) * rows);
+		void *tmp2 = realloc(vt->alt, sizeof(vt_line_t) * rows);
+		vt->screen = vt->screen == vt->primary ? tmp : tmp2;
+		vt->primary = tmp;
+		vt->alt = tmp2;
+		for(int32_t r = vt->max_rows; r < rows; r++) {
+			vt->primary[r].cells = malloc(vt->max_cols * sizeof(vt_cell_t));
+			vt->alt[r].cells = malloc(vt->max_cols * sizeof(vt_cell_t));
+			for(int32_t c = 0; c < vt->max_cols; ++c) {
+				vt->primary[r].cells[c].utf32 = ' ';
+				vt->primary[r].cells[c].fg = vt->fg;
+				vt->primary[r].cells[c].bg = vt->bg;
+				vt->primary[r].cells[c].attributes = 0;
+				vt->alt[r].cells[c].utf32 = ' ';
+				vt->alt[r].cells[c].fg = vt->fg;
+				vt->alt[r].cells[c].bg = vt->bg;
+				vt->alt[r].cells[c].attributes = 0;
+			}
+		}
 		vt->max_rows = rows;
-		vt->top = 0;
-		vt->bottom = rows - 1;
+		vt->bottom = rows-1;
 	}
 
 	if(vt->max_cols <= vt->cursor_pos.x) vt->cursor_pos.x = vt->max_cols - 1;
@@ -435,18 +455,28 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 	ioctl(vt->ptmx, TIOCSWINSZ, &wsz);
 	if(vt->term_mode & TERM_MODE_RESIZE_NOTIFY) {
 		char buffer[CSI_BUFFER_LEN] = { 0 };
-		snprintf(buffer, CSI_BUFFER_LEN, "\x1b[48;%d;%d;%d;%dt", vt->max_rows, vt->max_cols, ctx->height, ctx->width);
+		snprintf(buffer, CSI_BUFFER_LEN, "\x1b[48;%d;%d;%d;%dt", rows, cols, height, width);
 		write(vt->ptmx, buffer, strlen(buffer));
 	}
 
-	soda_shm_buffer_t *buffer = draw_frame(ctx);
-	if(buffer == NULL) {
-		log_error("draw_frame failed: %s\n", strerror(errno));
-		ctx->running = 0;
-		return;
+	if(ctx->buffer) {
+	ctx->buffer->free_after_use = true;
+		if(ctx->buffer && ctx->buffer->in_use == 0) {
+			soda_buffer_deinit(ctx->buffer);
+			ctx->buffer = NULL;
+		}
 	}
-	ctx->display->attach_shm(ctx->display, buffer->fd, buffer->width, buffer->height, buffer->stride, buffer->size, 0, 0);
-	soda_buffer_deinit(buffer);
+	ctx->buffer = soda_buffer_init(width, height, width * 4, width * 4 * height, FORMAT_ARGB8888);
+	uint32_t bg = ctx->vt->term_mode & TERM_MODE_REVERSE_VIDEO ? ctx->vt->def_fg : ctx->vt->def_bg;
+	uint32_t *buffer_data = ctx->buffer->data;
+	int32_t size = height * width;
+
+	for(int32_t y = 0; y < (int32_t)size; ++y) {
+		((uint32_t*)buffer_data)[y] = bg;
+	}
+
+	draw_frame(ctx, ctx->buffer);
+	ctx->display->attach_shm(ctx->display, ctx->buffer);
 }
 
 void term_handle_cliboard_str(void *data, const char *str) {
@@ -570,8 +600,6 @@ void term_handle_key(void *data, uint32_t key, uint32_t state) {
 
 		write(vt->ptmx, utf8, strlen(utf8));
 	}
-
-	ctx->dirty = 1;
 }
 
 void term_handle_keymap(void *data, struct xkb_keymap *keymap, struct xkb_state *state) {
@@ -622,6 +650,20 @@ static void usage(const char *arg0) {
 				 "\t--disable-harfbuzz\tdisable all harfbuzz shaping\n");
 
 	return;
+}
+
+void soda_term_redraw(void *data) {
+	soda_ctx_t *ctx = (soda_ctx_t*)data;
+	soda_shm_buffer_t *buffer = ctx->buffer;
+
+	if(ctx->buffer->in_use) {
+		buffer->free_after_use = true;
+		soda_shm_buffer_t *new = soda_buffer_init(buffer->width, buffer->height, buffer->stride, buffer->size, buffer->format);
+		memcpy(new->data, buffer->data, buffer->size);
+		ctx->buffer = new;
+	}
+	draw_frame(ctx, ctx->buffer);
+	ctx->display->attach_shm(ctx->display, ctx->buffer);
 }
 
 int main(int argc, char **argv) {
@@ -715,44 +757,69 @@ int main(int argc, char **argv) {
 	soda->display->callbacks.pointer_motion = term_handle_motion;
 	soda->display->callbacks.pointer_button = term_handle_button;
 	soda->display->callbacks.pointer_focus = term_handle_pointer_focus;
-	struct pollfd pfds[1] = { 0 };
+	soda->display->callbacks.redraw = soda_term_redraw;
+	struct pollfd *pfds = NULL;
+	int *fds = NULL;
+	int fdcount = soda->display->display_fds(soda->display, &fds);
+	if(fdcount == -1) {
+		log_error("getting display pollfds\n");
+		goto err_free_display;
+	}
+	pfds = calloc(fdcount+1, sizeof(struct pollfd));
+	if(pfds == NULL) {
+		free(fds);
+		goto err_free_display;
+	}
 
-	pfds[0].events = POLLIN;
-	pfds[0].fd = soda->vt->ptmx;
+	for(int i = 0; i < fdcount; ++i) {
+		pfds[i].fd = fds[i];
+		pfds[i].events = POLLIN;
+	}
+	free(fds);
+
+	pfds[fdcount].events = POLLIN;
+	pfds[fdcount].fd = soda->vt->ptmx;
+	fdcount++;
 
 	soda->width = 800;
 	soda->height = 600;
 
-	while(soda->running) {
+	while(soda->buffer == NULL) {
 		soda->display->dispatch(soda->display);
-		poll(pfds, 1, 0);
-		if(pfds[0].revents & (POLLHUP | POLLERR)) {
+	}
+
+	while(soda->running) {
+		poll(pfds, fdcount, -1);
+		for(int i = 0; i < fdcount - 1; ++i) {
+			if(pfds[i].revents & (POLLHUP | POLLERR)) {
+				soda->running = 0;
+				break;
+			} else if(pfds[i].revents & POLLIN) {
+				soda->display->dispatch(soda->display);
+			}
+		}
+		if(pfds[fdcount-1].revents & (POLLHUP | POLLERR)) {
 			soda->running = 0;
 			break;
-		} else if(pfds[0].revents & POLLIN) {
+		} else if(pfds[fdcount-1].revents & POLLIN) {
 			vt_event(soda->vt);
 			soda->dirty = 1;
 		}
-
 		if(soda->dirty) {
-			soda_shm_buffer_t *buffer = draw_frame(soda);
-			if(buffer == NULL) {
-				log_error("draw_frame failed: %s\n", strerror(errno));
-				soda->running = 0;
-				break;
-			}
-			soda->display->attach_shm(soda->display, buffer->fd, buffer->width, buffer->height, buffer->stride, buffer->size, 0, 0);
-			soda_buffer_deinit(buffer);
+			soda->display->request_frame_callback(soda->display);
 			soda->dirty = 0;
 		}
 	}
-
+	free(pfds);
 	soda->display->deinit(soda->display);
+	soda_buffer_deinit(soda->buffer);
 	soda_font_destroy(soda->font);
-	vt_deinit(soda->vt);	
+	vt_deinit(soda->vt);
 	free(soda);
 
 	return 0;
+err_free_display:
+	soda->display->deinit(soda->display);
 err_free_font:
 	soda_font_destroy(soda->font);
 err_free_vt:

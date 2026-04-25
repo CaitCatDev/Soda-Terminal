@@ -68,6 +68,8 @@ typedef struct wl_ctx_s {
 	struct xdg_wm_base *wm_base;
 	uint32_t width;
 	uint32_t height;
+
+	struct wl_callback *callback;
 } wayland_ctx_t;
 
 static const char *accepted_mimetypes[] = {
@@ -470,37 +472,57 @@ static const struct wl_registry_listener wl_registry_listener = {
 };
 
 void wl_buffer_release(void *data, struct wl_buffer *buffer) {
+	soda_shm_buffer_t *shm = (soda_shm_buffer_t*)data;
+
+	shm->buffer_freed(shm);
 	wl_buffer_destroy(buffer);
-	UNUSED(data);
 }
 
 static const struct wl_buffer_listener wl_buffer_listener = {
 	.release = wl_buffer_release,
 };
 
-int term_wl_display_attach_shm(soda_display_t *dpy, int fd, uint32_t width, uint32_t height, uint32_t stride, uint32_t size, uint32_t offset, uint32_t format) {
+int term_wl_display_attach_shm(soda_display_t *dpy, soda_shm_buffer_t *buffer) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
 
-	struct wl_shm_pool *pool = wl_shm_create_pool(wl->shm, fd, size);
+	struct wl_shm_pool *pool = wl_shm_create_pool(wl->shm, buffer->fd, buffer->size);
 	if(!pool) {
 		return -1;
 	}
 
-	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, offset, width, height, stride, format);
+	buffer->in_use = true;
+	struct wl_buffer *wl_buffer = wl_shm_pool_create_buffer(pool, 0, buffer->width, buffer->height, buffer->stride, buffer->format);
 	wl_shm_pool_destroy(pool);
-	wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
+	wl_buffer_add_listener(wl_buffer, &wl_buffer_listener, buffer);
 
-	wl_surface_attach(wl->surface, buffer, 0, 0);
+	wl_surface_attach(wl->surface, wl_buffer, 0, 0);
 #if defined(WL_SURFACE_OFFSET_SINCE_VERSION)
 	wl_surface_offset(wl->surface, 0, 0);
 #endif
 #if defined(WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
-	wl_surface_damage_buffer(wl->surface, 0, 0, width, height);
+	wl_surface_damage_buffer(wl->surface, 0, 0, buffer->width, buffer->height);
 #else
 	wl_surface_damage(wl->surface, 0, 0, width, height);
 #endif
 	wl_surface_commit(wl->surface);
+	wl_display_flush(wl->display);
 	return 0;
+}
+
+static int term_wl_get_fds(soda_display_t *dpy, int **fds) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
+
+	if(!fds) return -1;
+
+	*fds = calloc(2, sizeof(int));
+	if(*fds == NULL) {
+		return -1;
+	}
+
+	(*fds)[0] = wl_display_get_fd(wl->display);
+	(*fds)[1] = wl->timerfd;
+
+	return 2;
 }
 
 void term_wl_display_dispatch(soda_display_t *dpy) {
@@ -519,7 +541,7 @@ void term_wl_display_dispatch(soda_display_t *dpy) {
 		}
 		wl_display_flush(wl->display);
 
-		poll(pfds, 2, 50);
+		poll(pfds, 2, 0);
 		if(pfds[1].revents) {
 			read(wl->timerfd, &timer_expirations, sizeof(timer_expirations));
 			for(uint64_t exp = 0; exp < timer_expirations; exp++) {
@@ -535,7 +557,7 @@ void term_wl_display_dispatch(soda_display_t *dpy) {
 			wl_display_cancel_read(wl->display);
 			break;
 		}
-
+		while(wl_display_dispatch_pending(wl->display));
 	}
 }
 
@@ -684,6 +706,28 @@ void term_wl_display_request_clipboard(soda_display_t *dpy) {
 	free(buffer);
 }
 
+void wl_frame_callback_done(void *data, struct wl_callback *callback, uint32_t msec) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)data;
+	wl->callback = NULL;
+	wl_callback_destroy(callback);
+	wl->base.callbacks.redraw(wl->base.data);
+	UNUSED(msec);
+}
+
+static const struct wl_callback_listener wl_frame_callback_listener = {
+	.done = wl_frame_callback_done,
+};
+
+void term_wl_display_request_callback(soda_display_t *dpy) {
+	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
+	if(wl->callback) return;
+
+	wl->callback = wl_surface_frame(wl->surface);
+	wl_callback_add_listener(wl->callback, &wl_frame_callback_listener, wl);
+	wl_surface_commit(wl->surface);
+	wl_display_flush(wl->display);
+}
+
 void term_wl_display_deinit(soda_display_t *dpy) {
 	wayland_ctx_t *wl = (wayland_ctx_t*)dpy;
 
@@ -803,7 +847,9 @@ soda_display_t *soda_wl_display_init(void) {
 	wl->base.dispatch = term_wl_display_dispatch;
 	wl->base.attach_shm = term_wl_display_attach_shm;
 	wl->base.deinit = term_wl_display_deinit;
+	wl->base.display_fds = term_wl_get_fds;
 	wl->base.request_cliboard_text = term_wl_display_request_clipboard;
+	wl->base.request_frame_callback = term_wl_display_request_callback;
 	return &wl->base;
 
 err_free_surface:

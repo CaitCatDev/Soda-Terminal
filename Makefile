@@ -6,8 +6,8 @@ LD=clang
 WL_SCANNER=`pkg-config --variable=wayland_scanner wayland-scanner`
 WL_PROTOCOLS=`pkg-config --variable=pkgdatadir wayland-protocols`
 
-CFLAGS=-O0 -std=c99 -DTERM_WL_SUPPORT=1 -DTERM_X11_SUPPORT=1 -I ./include/ -I ./ -g `pkg-config --cflags fontconfig freetype2 wayland-client xkbcommon harfbuzz`
-LDFLAGS=`pkg-config --libs fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11 harfbuzz xcb xcb-shm xcb-xkb`
+CFLAGS=-O3 -g -std=c99 -DTERM_WL_SUPPORT=1 -DTERM_X11_SUPPORT=1 -I ./include/ -I ./ -g `pkg-config --cflags fontconfig freetype2 wayland-client xkbcommon harfbuzz`
+LDFLAGS=`pkg-config --libs fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11 harfbuzz xcb xcb-shm xcb-xkb xcb-present`
 
 TARGET=soda-terminal
 COBJS=./src/main.o ./src/wayland.o ./src/x11.o ./xdg-shell-protocol-code.o ./src/log.o ./src/font.o ./src/vt.o
