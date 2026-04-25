@@ -19,6 +19,7 @@
 #include <soda-term/log.h>
 
 #define VT_BUFFER_LEN 512
+#define VT_HISTROY_LEN 1000
 
 void vt_setcursor_pos(vt_ctx_t *term, int32_t x, int32_t y) {
 	if(term->term_mode & TERM_MODE_ORIGIN) {
@@ -554,7 +555,7 @@ void vt_set_sgr(vt_ctx_t *term, uint32_t *params, uint32_t pcount) {
 			case 38:
 				switch(params[p+1]) {
 					case 2:
-						term->fg = MAKE_ARGB(params[p + 2], params[p + 3], params[p + 4]);
+						term->fg = MAKE_ARGB(0xff, params[p + 2], params[p + 3], params[p + 4]);
 						p+=4;
 						break;
 					case 5:
@@ -581,7 +582,7 @@ void vt_set_sgr(vt_ctx_t *term, uint32_t *params, uint32_t pcount) {
 			case 48:
 				switch(params[p+1]) {
 					case 2:
-						term->bg = MAKE_ARGB(params[p + 2], params[p + 3], params[p + 4]);
+						term->bg = MAKE_ARGB(0xff, params[p + 2], params[p + 3], params[p + 4]);
 						p+=4;
 						break;
 					case 5:
@@ -765,14 +766,14 @@ void vt_fallback_color_table(vt_ctx_t *term) {
 	for(uint32_t r = 0; r < 6; r++) {
 		for(uint32_t g = 0; g < 6; g++) {
 			for(uint32_t b = 0; b < 6; b++) {
-				term->colortable[16 + 36 * r + 6 * g + b] = MAKE_ARGB(r * 41, g * 41, b * 41);
+				term->colortable[16 + 36 * r + 6 * g + b] = MAKE_ARGB(0xff, r * 41, g * 41, b * 41);
 			}
 		}
 	}
 
 	for(uint32_t i = 232; i <= 255; ++i) {
 		uint8_t p = (uint32_t)(10.625 * (i - 232));
-		term->colortable[i] = MAKE_ARGB(p, p, p);
+		term->colortable[i] = MAKE_ARGB(0xff, p, p, p);
 	}
 }
 
@@ -909,7 +910,13 @@ void vt_csi_exec(vt_ctx_t *term, const char *csi, uint32_t len) {
 							vt_clear_screen(term);
 							break;
 						case 3:
-							log_warn("Erase Scrollback TODO\n");
+							term->yabs = 0;
+							for(int32_t r = 0; r < term->history_rows; r++) {
+								if(term->history[r].cells) {
+									free(term->history[r].cells);
+								}
+								term->history[r].cells = NULL;
+							}
 							break;
 						default:
 							goto unknown_csi;
@@ -1081,12 +1088,33 @@ void vt52_escape_process(vt_ctx_t *vt, uint8_t escape, uint8_t y, uint8_t x) {
 
 void vt_scroll(vt_ctx_t *term) {
 	if(term->cursor_pos.y >= term->bottom) {
-		for(int32_t i = term->top+1; i <= term->bottom; i++) {
-			memcpy(term->screen[i-1].cells, term->screen[i].cells, term->max_cols * sizeof(vt_cell_t));
+		vt_cell_t *newline = NULL;
+
+		/*Reuse last history line if it's populated*/
+		if(term->history[term->history_rows-1].cells) {
+			log_debug("Reusing history line\n");
+			newline = term->history[term->history_rows-1].cells;
+		} else {
+			newline = calloc(term->max_cols, sizeof(vt_cell_t));
 		}
+
+		for(int32_t i = term->history_rows - 1; i >= 1; i--) {
+			/*Shuffle each pointer*/
+			term->history[i].cells = term->history[i-1].cells;
+		}
+
+		term->history[0].cells = term->screen[term->top].cells;
+		for(int32_t i = term->top+1; i <= term->bottom; i++) {
+			term->screen[i-1].cells = term->screen[i].cells;
+		}
+
+		term->screen[term->bottom].cells = newline;
 		term->cursor_pos.y = term->bottom;
 		for(int32_t i = 0; i < term->max_cols; i++) {
-			term->screen[term->cursor_pos.y].cells[i].utf32 = ' ';
+			newline[i].utf32 = ' ';
+			newline[i].fg = term->fg;
+			newline[i].bg = term->bg;
+			newline[i].attributes = term->attributes;
 		}
 		term->cursor_pos.x = 0;
 	} else {
@@ -1298,6 +1326,7 @@ int vt_forkshell(int parent, int child, pid_t *pout) {
 void vt_deinit(vt_ctx_t *vt) {
 	vt_free_screen(vt->primary, vt->max_rows);
 	vt_free_screen(vt->alt, vt->max_rows);
+	vt_free_screen(vt->history, vt->history_rows);
 	free(vt->tabstops);
 
 	close(vt->ptmx);
@@ -1329,6 +1358,9 @@ vt_ctx_t *vt_init(uint32_t fg, uint32_t bg) {
 
 	vt->primary = vt_allocate_screen(vt->max_rows, vt->max_cols);
 	vt->alt = vt_allocate_screen(vt->max_rows, vt->max_cols);
+	vt->history_rows = VT_HISTROY_LEN;
+	vt->history = calloc(vt->history_rows, sizeof(vt_line_t));
+
 	vt->screen = vt->primary;
 	vt->cursor.bg = bg;
 	vt->cursor.fg = fg;

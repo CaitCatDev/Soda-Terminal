@@ -44,7 +44,6 @@ typedef struct soda_ctx {
 	int running;
 	int dirty;
 
-
 	vt_ctx_t *vt;
 	soda_shm_buffer_t *buffer;
 
@@ -155,7 +154,7 @@ static inline void put_pixel(soda_shm_buffer_t *buffer, int32_t x, int32_t y, ui
 	data[y * w + x] = px;
 }
 
-uint32_t get_pixel(soda_shm_buffer_t *buffer, int32_t x, int32_t y) {
+static inline uint32_t get_pixel(soda_shm_buffer_t *buffer, int32_t x, int32_t y) {
 	uint32_t *data = (uint32_t*)buffer->data;
 	int32_t w = buffer->width;
 	int32_t h = buffer->height;
@@ -171,19 +170,22 @@ uint32_t get_pixel(soda_shm_buffer_t *buffer, int32_t x, int32_t y) {
 }
 
 static uint32_t alpha_blend(uint32_t cnew, uint32_t cdst, uint8_t alpha) {
+	uint8_t an = (cnew >> 24) & 0xff;
 	uint8_t rn = (cnew >> 16) & 0xff;
 	uint8_t gn = (cnew >> 8) & 0xff;
 	uint8_t bn = (cnew) & 0xff;
 
+	uint8_t ad = (cdst >> 24) & 0xff;
 	uint8_t rd = (cdst >> 16) & 0xff;
 	uint8_t gd = (cdst >> 8) & 0xff;
 	uint8_t bd = (cdst) & 0xff;
 
+	uint8_t ao = (alpha * (an - ad) + (ad << 8)) >> 8;
 	uint8_t ro = (alpha * (rn - rd) + (rd << 8)) >> 8;
 	uint8_t go = (alpha * (gn - gd) + (gd << 8)) >> 8;
 	uint8_t bo = (alpha * (bn - bd) + (bd << 8)) >> 8;
 
-	return MAKE_ARGB(ro, go, bo);
+	return MAKE_ARGB(ao, ro, go, bo);
 }
 
 static uint32_t desaturate(uint32_t cnew, uint8_t intensity) {
@@ -195,7 +197,7 @@ static uint32_t desaturate(uint32_t cnew, uint8_t intensity) {
 	uint8_t go = (gn * intensity) >> 8;
 	uint8_t bo = (bn * intensity) >> 8;
 
-	return MAKE_ARGB(ro, go, bo);
+	return MAKE_ARGB(0xff, ro, go, bo);
 }
 
 static void render_glyph(soda_shm_buffer_t *buffer, soda_font_t *font, uint32_t glyph_index, int32_t x, int32_t y, uint32_t fg) {
@@ -248,7 +250,7 @@ static void render_term_cell(soda_shm_buffer_t *buffer, soda_font_t *font, uint3
 		for(uint32_t cx = 0; cx < width; cx++) {
 			uint8_t alpha = bitmap[cy * pitch + cx];
 			uint32_t px = alpha_blend(fg, bg, alpha);
-			data[(y + cy + font->ascent - glyph->bitmap_top) * buffer->width + (x + cx + glyph->bitmap_left)] = px;
+			put_pixel(buffer, x + cx + glyph->bitmap_left, y + cy + font->ascent - glyph->bitmap_top, px);
 		}
 	}
 
@@ -282,10 +284,18 @@ static int render_term_text_hb(vt_ctx_t *ctx, soda_font_t *font, soda_shm_buffer
 		hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
 		hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
 		hb_buffer_set_language(buf, hb_language_from_string("en", -1));
-		vt_line_t line = ctx->screen[i];
-		if(line.dirty == 0) {
-			break;
+		vt_line_t line;
+		if(i < abs(ctx->yabs)) {
+			line = ctx->history[abs(ctx->yabs) - 1 - i];
+			line.dirty = 1;
+		} else {
+			line = ctx->screen[i-abs(ctx->yabs)];
 		}
+
+		if(line.dirty == 0) {
+			continue;
+		}
+
 		line.dirty = 0;
 		if(hb_buffer_allocation_successful(buf) == false) {
 			log_error("hb_buffer_create failed: %s\n", strerror(errno));
@@ -310,21 +320,30 @@ static int render_term_text_hb(vt_ctx_t *ctx, soda_font_t *font, soda_shm_buffer
 
 static int render_term_text_ft(vt_ctx_t *ctx, soda_font_t *font, soda_shm_buffer_t *buffer) {
 	for(int32_t y = 0; y < ctx->max_rows; ++y) {
+		vt_line_t line;
+		if(y < abs(ctx->yabs)) {
+			line = ctx->history[abs(ctx->yabs) - 1 - y];
+			line.dirty = 1;
+		} else {
+			line = ctx->screen[y-abs(ctx->yabs)];
+		}
+
+		if(line.dirty == 0) {
+			continue;
+		}
+
+		line.dirty = 0;
 		for(int32_t x = 0; x < ctx->max_cols; ++x) {
-			if((ctx->screen[y].cells[x].attributes & TERM_CELL_ATTRIBUTE_DIRTY) == 0) {
-				continue;
-			}
 			for(uint32_t cy = 0; cy < font->yadv; cy++) {
 				for(uint32_t cx = 0; cx < font->xadv; cx++) {
-					put_pixel(buffer, x * font->xadv + cx, font->yadv * y + cy, ctx->screen[y].cells[x].bg);
+					put_pixel(buffer, x * font->xadv + cx, font->yadv * y + cy, line.cells[x].bg);
 				}
 			}
 
 			if(ctx->screen[y].cells[x].utf32) {
-				uint32_t gi = FT_Get_Char_Index(font->face, ctx->screen[y].cells[x].utf32);
-				render_term_cell(buffer, font, gi, font->xadv * x, y * font->yadv, &ctx->screen[y].cells[x]);
+				uint32_t gi = FT_Get_Char_Index(font->face, line.cells[x].utf32);
+				render_term_cell(buffer, font, gi, font->xadv * x, y * font->yadv, &line.cells[x]);
 			}
-			ctx->screen[y].cells[x].attributes &= ~TERM_CELL_ATTRIBUTE_DIRTY;
 		}
 	}
 	return 0;
@@ -339,8 +358,8 @@ int draw_frame(soda_ctx_t *ctx, soda_shm_buffer_t *buffer) {
 		render_term_text_hb(ctx->vt, ctx->font, buffer);
 	}
 
-	if(ctx->vt->term_mode & TERM_MODE_SHOW_CURSOR) {
-		render_char(buffer, ctx->font, ctx->vt->cursor.utf32, ctx->font->xadv * ctx->vt->cursor_pos.x, ctx->vt->cursor_pos.y * ctx->font->yadv, fg);
+	if(ctx->vt->term_mode & TERM_MODE_SHOW_CURSOR && abs(ctx->vt->yabs) + ctx->vt->cursor_pos.y < ctx->vt->max_rows) {
+		render_char(buffer, ctx->font, ctx->vt->cursor.utf32, ctx->font->xadv * ctx->vt->cursor_pos.x, (abs(ctx->vt->yabs) + ctx->vt->cursor_pos.y) * ctx->font->yadv, fg);
 	}
 
 	return 0;
@@ -360,7 +379,7 @@ static void send_arrow_key(vt_ctx_t *term, char c) {
 }
 
 static void term_mouse_report(soda_ctx_t *ctx, bool motion, uint32_t btn, uint32_t state, int32_t x, int32_t y) {
-	char buffer[64] = { 0 };
+	char buffer[CSI_BUFFER_LEN] = { 0 };
 	size_t len = 0;
 	uint32_t i = 0;
 	uint8_t c = 0;
@@ -380,7 +399,7 @@ static void term_mouse_report(soda_ctx_t *ctx, bool motion, uint32_t btn, uint32
 	}
 
 	if(ctx->vt->pointer_mode & TERM_MODE_MOUSE_SGR) {
-		len = snprintf(buffer, 64, "\x1b[<%d;%d;%d%c", c, x+1, y+1, (state | motion) ? 'M' : 'm');
+		len = snprintf(buffer, CSI_BUFFER_LEN, "\x1b[<%d;%d;%d%c", c, x+1, y+1, (state | motion) ? 'M' : 'm');
 		write(ctx->vt->ptmx, buffer, len);
 		return;
 	}
@@ -389,7 +408,7 @@ static void term_mouse_report(soda_ctx_t *ctx, bool motion, uint32_t btn, uint32
 	if(x < 223 && y < 223) return;
 
 	if(ctx->vt->pointer_mode & (TERM_MODE_MOUSE_X10 | TERM_MODE_MOUSE_NORMAL | TERM_MODE_MOUSE_MOTION_ALL | TERM_MODE_MOUSE_BUTTON)) {
-		snprintf(buffer, 64, "\x1b[M%c%c%c", ' '+c, ' '+x+1, ' '+y+1);
+		snprintf(buffer, CSI_BUFFER_LEN, "\x1b[M%c%c%c", ' '+c, ' '+x+1, ' '+y+1);
 		write(ctx->vt->ptmx, buffer, 6);
 	}
 }
@@ -402,6 +421,22 @@ void term_handle_motion(void *data, int32_t x, int32_t y) {
 
 	if((ctx->button_state && ctx->vt->pointer_mode & TERM_MODE_MOUSE_BUTTON) || ctx->vt->pointer_mode & TERM_MODE_MOUSE_MOTION_ALL) {
 		term_mouse_report(ctx, true, 0, 0, ctx->x, ctx->y);
+	}
+
+	if((ctx->button_state) && y <= 0) {
+		ctx->vt->yabs--;
+		if(ctx->vt->yabs < -ctx->vt->history_rows) {
+			ctx->vt->yabs = -ctx->vt->history_rows;
+		} else if(ctx->vt->history[abs(ctx->vt->yabs)-1].cells == NULL) {
+			ctx->vt->yabs++;
+		}
+		ctx->dirty = 1;
+	} else if((ctx->button_state) && y >= ctx->height) {
+		ctx->vt->yabs++;
+		if(ctx->vt->yabs > 0) {
+			ctx->vt->yabs = 0;
+		}
+		ctx->dirty = 1;
 	}
 }
 
@@ -463,9 +498,19 @@ void term_handle_configure(void *data, uint32_t width, uint32_t height) {
 				vt->alt[r].cells[c].attributes = 0;
 			}
 		}
+		for(int32_t r = 0; r < vt->history_rows; r++) {
+			if(vt->history[r].cells == NULL) break;
+			void *tmp = realloc(vt->history[r].cells, sizeof(vt_cell_t) * cols);
+			vt->history[r].cells = tmp;
+			for(int32_t c = vt->max_cols; c < cols; c++) {
+				vt->history[r].cells[c].utf32 = ' ';
+				vt->history[r].cells[c].fg = vt->fg;
+				vt->history[r].cells[c].bg = vt->bg;
+				vt->history[r].cells[c].attributes = 0;
+			}
+		}
 		vt->max_cols = cols;
 	}
-
 
 	if(rows != vt->max_rows) {
 		for(int32_t r = rows; r < vt->max_rows; r++) {
@@ -601,6 +646,7 @@ int term_handle_key_application(soda_ctx_t *ctx, uint32_t key) {
 			return 1;
 		}
 	}
+
 	return 0;
 }
 
@@ -609,6 +655,7 @@ void term_handle_key(void *data, uint32_t key, uint32_t state) {
 	vt_ctx_t *vt = ctx->vt;
 	xkb_keysym_t keysym = 0;
 	char utf8[5] = { 0 };
+	vt->yabs = 0;
 
 	if(state == 0) {
 		return;

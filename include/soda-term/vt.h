@@ -85,7 +85,7 @@ typedef uint32_t utf32_t;
 #define MAX(a, b) (a > b ? a : b)
 #define CTRL_CODE(c) ((c <= 0x1f) | IN_RANGE(c, 0x80, 0x9f))
 
-#define MAKE_ARGB(r, g, b) ((uint32_t)0xff000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | ((uint32_t)b))
+#define MAKE_ARGB(a, r, g, b) (((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | ((uint32_t)b))
 
 typedef struct {
 	utf32_t utf32;
@@ -118,6 +118,7 @@ typedef struct vt_ctx_s {
 	uint32_t csi_len;
 	uint8_t strescape_buffer[DCS_BUFFER_LEN];
 
+	int32_t yabs;
 	int32_t max_cols;
 	int32_t max_rows;
 	int32_t top;
@@ -129,6 +130,9 @@ typedef struct vt_ctx_s {
 	vt_line_t *screen;
 	vt_cell_t cursor;
 	utf32_t last_char;
+
+	int32_t history_rows;
+	vt_line_t *history;
 
 	uint32_t fg;
 	uint32_t bg;
